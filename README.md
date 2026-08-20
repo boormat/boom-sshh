@@ -1,120 +1,158 @@
 # ssh-agent-history
-ssh agent with extra capabilities, history logging.
 
-The goal is an extension to ssh-agent to fullfill a few things.
+An SSH agent that logs command history from remote hosts via the SSH agent protocol extension mechanism.
 
-1. Centralised logging of all command history.  Add a small binary or script intended to 
-be called on the CLIENT side bash command prompt to send a message over ssh-agent 
-channel.
- The client can probably simply be a bash function to format the message.  (printf into the pipe?)
+The agent runs locally and accepts standard SSH agent requests (key storage, signing) plus a custom `HISTORY` extension. Remote hosts send each command over the forwarded `SSH_AUTH_SOCK` using a bash `trap DEBUG` hook.
 
-2. PKI Certificate managment.  Provide a PKCS#11 implementation that tunnels over ssh-agent.
-   A shared library on target hosts, so that wget, curl, git, firefox etc can use your PKI 
-   credentials.  Possibly pass through to a PKCS#11 thing such as GnomeKeyRing to manage all the 
-   above.
-## Build
+## How it works
 
-Make em smaller.  4MB is OK.. but sheesh.
-go build -ldflags="-s -w" 
-Plus get UPX to pack them smaller.  (not in RHEL :-( )
+```
+┌──────────┐   SSH agent protocol    ┌──────────────┐
+│ remote   │ ─────────────────────── │ ssh-agent-   │
+│ bash     │   HISTORY extension     │ history      │
+│ (trap)   │   over forwarded sock   │ (local)      │
+└──────────┘                         └──────┬───────┘
+                                            │
+                                     writes to
+                                            ▼
+                                     ~/.history_all
+```
 
-Maybe the message code in go might be small fast enough to ignore bash?  (Especially since would still need
-.so for PKSC#11 api)
+Each history entry is written with a timestamp, hostname, and user:
 
- ## Bash
- 
- Testing... with bash.
- Getting binary output needs a escape codes.  To do it dynamically, chain 2 printfs
-   printf  '\x23\n' | xxd
-   printf $(printf '\\x%d\\n' 23 ) | xxd
+```
+#1700000000 myhost 1000
+ls -la /etc/hosts
+```
 
-Talking to unix domain sockets seems to need netcat.
-  printf  '\x0\x0\x0\x01\xB' | nc -U  $SSH_AUTH_SOCK
- 
-  printf  '\x0\x0\x0\x0A\x1B\x0\x0\x0\x05Hello' | nc -U  $SSH_AUTH_SOCK
-  printf  '\x0\lx0\x0\x0E\x1B\x0\x0\x0\x05Hello\x0\x0\x0\x0' | nc -U  $SSH_AUTH_SOCK | xxd
-  printf  '\x0\x0\x0\x0E\x1B\x0\x0\x0\x05Hello\x0\x0\x0\x0' | nc -U  $SSH_AUTH_SOCK | xxd
+## Install
 
-Message format is 4 bytes of message length, then 1 byte of message type, then per message.
+### Pre-built binaries
 
-E.g. list identities: Type  11 (0xB)
-     agent extension: Type 27 (0x1B)  Then a string, then byte[]
-     string is a 32bit length, then bytes. (ie same as message)
-    byte[] in Extension message needs to be a string too (according to golang server)
+Download from [GitHub Releases](https://github.com/boormat/ssh-agent-history/releases).
 
+### From source
 
-Notes.   Ssh agent seems to close socket on response, so golang code setup to do the same.
+With [mise](https://mise.jdx.dev):
 
+```bash
+git clone https://github.com/boormat/ssh-agent-history.git
+cd ssh-agent-history
+mise install
+go build -ldflags="-s -w"
+```
 
+Or with Go already installed:
 
-## BASH Config
+```bash
+go install github.com/boormat/ssh-agent-history@latest
+```
 
-Hooking into bash history... 
-There is trap DEBUG and PROMPT_COMMAND and PS0
+## Quick start
 
-PS0 does what we want, but is only on bash 4.4+.  :-(
-PROMPT_COMMAND only fires when command finishes. Lame if it never does.
-DEBUG trap fires for every command on the line, so you get duplicates.
+1. Run the agent locally:
 
-BASH_COMMAND ... might be the same as history 1 maybe
-The Debug trap thing would be bad if smashing a loop, so we will just detect a dupe to
-prevent that.  (You can use A combo of DEBUG and PROMPT_COMMAND to supress the duplicates
-but that is probably not required)
+```bash
+eval $(./ssh-agent-history)
+```
 
+This prints `SSH_AUTH_SOCK=...; export SSH_AUTH_SOCK;` and starts the agent.
 
-Just checking the history number We just use history to dedupe, 
+2. SSH to a remote host with agent forwarding:
 
-    function PreCommand() {
+```bash
+ssh -A user@remote-host
+```
+
+3. Configure the remote host (idempotent, safe to re-run):
+
+```bash
+./remote-setup.sh user@remote-host
+```
+
+4. Commands are now logged to `~/.history_all` on your local machine.
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
+
+Set it before starting the agent:
+
+```bash
+AGENT_HISTFILE=~/my-agent-history eval $(./ssh-agent-history)
+```
+
+## Remote setup (manual)
+
+If you prefer not to use `remote-setup.sh`, add this to your remote host's `~/.bashrc`:
+
+```bash
+export AGENT_HISTFILE="${HOME}/.history_all"
+
+__ha_to_ssh_int32() {
+    local l=${1}
+    printf '\\x%02X\\x%02x\\x%02X\\x%02X' \
+        $((0xFF & l>>24)) $((0xFF & l>>16)) $((0xFF & l>>8)) $((0xFF & l>>0))
+}
+
+__ha_to_ssh_int8() {
+    local l=${1}
+    printf '\\x%02X' $((0xFF & l))
+}
+
+__ha_to_ssh_string() {
+    declare -i l
+    l=${#1}
+    printf '%s%b' "$(__ha_to_ssh_int32 l)" "$1"
+}
+
+__ha_hist_get() {
     local _cmd
-    _cmd=$(history 1)
-    _cmd=${_cmd:0:7}
-    if [[ $_cmd != $_lastCommand ]]
-    then
-        #echo CHANGEd _cmd=$_cmd _lastCommand=$_lastCommand BASH_COMMAND="$BASH_COMMAND"
-        _lastCommand="$_cmd"
+    _cmd="$(history 1)"
+    _cmd=${_cmd:7}
+    local msgtype="HISTORY"
+    local payloadlen="$(( 4 + ${#_cmd} + 4 + ${#HOSTNAME} + 4 + ${#UID} ))"
+    local totallen="$(( 1 + 4 + ${#msgtype} + 4 + payloadlen ))"
+    printf %s%s%s%s%s%s%s \
+        "$(__ha_to_ssh_int32 totallen)" \
+        "$(__ha_to_ssh_int8 27)" \
+        "$(__ha_to_ssh_string "${msgtype}")" \
+        "$(__ha_to_ssh_int32 payloadlen)" \
+        "$(__ha_to_ssh_string "${_cmd}")" \
+        "$(__ha_to_ssh_string "${HOSTNAME}")" \
+        "$(__ha_to_ssh_string "${UID}")"
+}
 
-        # TODO send history here
+__ha_history_trap() {
+    local _cmd=$(history 1)
+    local _cmdid=${_cmd:0:7}
+    if [[ "$_cmdid" != "$_lastCommand" ]]; then
+        _lastCommand="$_cmdid"
+        printf "$(__ha_hist_get)" | nc -U "$SSH_AUTH_SOCK" > /dev/null 2>&1
     fi
-    }
-    trap PreCommand DEBUG
+}
 
+trap __ha_history_trap DEBUG
+```
 
+## Testing locally
 
+You can test without SSH by setting `TEST_SSH_AUTH_SOCK`:
 
+```bash
+export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
+./ssh-agent-history &
+# agent listens on /tmp/test-agent.sock instead of a random path
+```
 
+## Building
 
+```bash
+go build -ldflags="-s -w" -o ssh-agent-history
+```
 
-### Notes
+## License
 
-
-More complex way to simulate PS0, uses both DEBUG trap and PROMPT_COMMAND
-
-        # This will run before any command is executed.
-        function PreCommand() {
-        if [ -z "$AT_PROMPT" ]; then
-            return
-        fi
-        unset AT_PROMPT
-
-        # Do stuff.
-        echo "Running PreCommand"
-        }
-        trap "PreCommand" DEBUG
-
-        # This will run after the execution of the previous full command line.  We don't
-        # want it PostCommand to execute when first starting a bash session (i.e., at
-        # the first prompt).
-        FIRST_PROMPT=1
-        function PostCommand() {
-        AT_PROMPT=1
-
-        if [ -n "$FIRST_PROMPT" ]; then
-            unset FIRST_PROMPT
-            return
-        fi
-
-        # Do stuff.
-        echo "Running PostCommand"
-        }
-        PROMPT_COMMAND="PostCommand"
-
+GPL-3.0 — see [LICENSE](LICENSE).

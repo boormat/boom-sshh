@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
+
 	"log"
 	"net"
 	"os"
@@ -80,7 +80,7 @@ func main() {
 	if !testmode {
 
 		// Create the real SSH Agent Named Pipe
-		tmpDir, err := ioutil.TempDir("", "ssh-go")
+		tmpDir, err := os.MkdirTemp("", "ssh-go")
 		if err != nil {
 			log.Fatal(err)
 		}
