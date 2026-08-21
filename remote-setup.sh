@@ -6,6 +6,10 @@
 #
 # The agent runs locally; this script configures the remote host's bash
 # to send command history over the forwarded SSH_AUTH_SOCK.
+#
+# Requires `histsend` binary to be installed on the remote host.
+# Build with: cargo build --release -p histsend
+# Then copy target/release/histsend to the remote's PATH.
 
 set -euo pipefail
 
@@ -16,55 +20,16 @@ fi
 
 MARKER="# ssh-agent-history begin"
 
-# The full bash config block to inject
+# The bash config block to inject into ~/.bashrc
 read -r -d '' CONFIG_BLOCK << 'BLOCK'
 # ssh-agent-history begin
 # Automatically added by remote-setup.sh — do not edit between markers.
-export AGENT_HISTFILE="${HOME}/.history_all"
-
-__ha_to_ssh_int32() {
-    local l=${1}
-    printf '\\x%02X\\x%02x\\x%02X\\x%02X' \
-        $((0xFF & l>>24)) $((0xFF & l>>16)) $((0xFF & l>>8)) $((0xFF & l>>0))
-}
-
-__ha_to_ssh_int8() {
-    local l=${1}
-    printf '\\x%02X' $((0xFF & l))
-}
-
-__ha_to_ssh_string() {
-    declare -i l
-    l=${#1}
-    printf '%s%b' "$(__ha_to_ssh_int32 l)" "$1"
-}
-
-__ha_hist_get() {
-    local _cmd
-    _cmd="$(history 1)"
-    _cmd=${_cmd:7}
-    local msgtype="HISTORY"
-    local payloadlen="$(( 4 + ${#_cmd} + 4 + ${#HOSTNAME} + 4 + ${#UID} ))"
-    local totallen="$(( 1 + 4 + ${#msgtype} + 4 + payloadlen ))"
-    printf %s%s%s%s%s%s%s \
-        "$(__ha_to_ssh_int32 totallen)" \
-        "$(__ha_to_ssh_int8 27)" \
-        "$(__ha_to_ssh_string "${msgtype}")" \
-        "$(__ha_to_ssh_int32 payloadlen)" \
-        "$(__ha_to_ssh_string "${_cmd}")" \
-        "$(__ha_to_ssh_string "${HOSTNAME}")" \
-        "$(__ha_to_ssh_string "${UID}")"
-}
-
+# Requires `histsend` binary in PATH (build: cargo build --release -p histsend)
 __ha_history_trap() {
-    local _cmd=$(history 1)
-    local _cmdid=${_cmd:0:7}
-    if [[ "$_cmdid" != "$_lastCommand" ]]; then
-        _lastCommand="$_cmdid"
-        printf "$(__ha_hist_get)" | nc -U "$SSH_AUTH_SOCK" > /dev/null 2>&1
-    fi
+    local _line
+    _line=$(history 1)
+    [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
 }
-
 trap __ha_history_trap DEBUG
 # ssh-agent-history end
 BLOCK

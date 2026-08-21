@@ -1,0 +1,9 @@
+[package]
+name = "histsend"
+version = "0.1.0"
+edition = "2021"
+description = "SSH agent HISTORY extension client"
+
+[[bin]]
+name = "histsend"
+path = "src/main.rs"

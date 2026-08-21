@@ -1,9 +1,6 @@
 # Binaries
-ssh-agent-history
+/target/
 *.exe
-
-# Go
-/vendor/
 
 # IDE
 .idea/
