@@ -1,4 +1,5 @@
 mod agent;
+mod setup;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -34,6 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("--extract-client") => extract_client(&args[2..]),
         Some("--list-clients") => Ok(list_clients()),
+        Some("--setup") => setup::run_setup(&args[2..], false),
+        Some("--dry-run") | Some("-d") => {
+            let rest: Vec<String> = args[2..].iter().filter(|a| !a.starts_with('-')).cloned().collect();
+            setup::run_setup(&rest, true)
+        }
         Some(other) => {
             eprintln!("error: unknown argument '{other}'");
             eprintln!();
@@ -51,11 +57,16 @@ fn print_help() {
     println!("ssh-agent-history — SSH agent with HISTORY extension for logging remote commands");
     println!();
     println!("Usage:");
-    println!("  ssh-agent-history                        Start the agent (eval output)");
-    println!("  ssh-agent-history --help                 Show this help");
-    println!("  ssh-agent-history --version              Show version");
-    println!("  ssh-agent-history --list-clients         List embedded client architectures");
-    println!("  ssh-agent-history --extract-client <arch> <path>  Extract client binary");
+    println!("  ssh-agent-history                                     Start the agent");
+    println!("  ssh-agent-history --setup <host>                      Setup remote host");
+    println!("  ssh-agent-history --setup --dry-run <host>            Preview setup (no changes)");
+    println!("  ssh-agent-history --help                              Show this help");
+    println!("  ssh-agent-history --version                           Show version");
+    println!("  ssh-agent-history --list-clients                      List embedded clients");
+    println!("  ssh-agent-history --extract-client <arch> <path>      Extract client binary");
+    println!();
+    println!("Setup detects remote shell (bash/zsh/fish), installs histsend,");
+    println!("and injects the appropriate trap into shell config files.");
     println!();
     println!("Environment variables:");
     println!("  SSH_AUTH_SOCK          Agent socket path (set automatically)");
@@ -65,8 +76,9 @@ fn print_help() {
     println!();
     println!("Examples:");
     println!("  eval $(ssh-agent-history)");
-    println!("  ssh-agent-history --list-clients");
-    println!("  ssh-agent-history --extract-client x86_64-linux /tmp/histsend");
+    println!("  ssh-agent-history --setup user@remote-host");
+    println!("  ssh-agent-history --setup -p 2222 user@remote-host");
+    println!("  ssh-agent-history --setup --dry-run user@remote-host");
 }
 
 fn extract_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

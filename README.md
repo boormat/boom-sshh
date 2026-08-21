@@ -34,18 +34,16 @@ With [mise](https://mise.jdx.dev):
 git clone https://github.com/boormat/ssh-agent-history.git
 cd ssh-agent-history
 mise install
-cargo build --release
+zig build
 ```
 
-Or with Rust already installed:
+Or with Rust + Zig already installed:
 
 ```bash
-cargo build --release
+zig build
 ```
 
-Binaries are at:
-- `target/release/ssh-agent-history` — the agent
-- `target/release/histsend` — the remote client
+This builds the Zig client for all platforms and the Rust agent with embedded clients.
 
 ## Quick start
 
@@ -57,20 +55,54 @@ eval $(./target/release/ssh-agent-history)
 
 This prints `SSH_AUTH_SOCK=...; export SSH_AUTH_SOCK;` and starts the agent.
 
-2. SSH to a remote host with agent forwarding:
+2. Set up a remote host:
+
+```bash
+./target/release/ssh-agent-history --setup user@remote-host
+```
+
+This detects the remote shell, installs `histsend`, and injects the trap into `~/.bashrc` (or `~/.zshrc`, `~/.config/fish/config.fish` if they exist).
+
+3. SSH to the remote with agent forwarding:
 
 ```bash
 ssh -A user@remote-host
 ```
 
-3. Copy `histsend` to the remote and configure it:
+4. Commands are now logged to `~/.history_all` on your local machine.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `ssh-agent-history` | Start the agent |
+| `ssh-agent-history --setup <host>` | Setup remote host |
+| `ssh-agent-history --setup --dry-run <host>` | Preview setup (no changes) |
+| `ssh-agent-history --help` | Show help |
+| `ssh-agent-history --version` | Show version |
+| `ssh-agent-history --list-clients` | List embedded client architectures |
+| `ssh-agent-history --extract-client <arch> <path>` | Extract client binary |
+
+### Setup
+
+`--setup` detects the remote shell and architecture, then:
+
+1. Installs `histsend` to `~/.local/bin/histsend` on the remote
+2. Injects the appropriate trap into each shell config file that exists:
+   - `~/.bashrc` — bash trap
+   - `~/.zshrc` — zsh trap
+   - `~/.config/fish/conf.d/ssh-agent-history.fish` — fish trap
 
 ```bash
-scp target/release/histsend user@remote-host:~/.local/bin/
-./remote-setup.sh user@remote-host
-```
+# Basic setup
+ssh-agent-history --setup user@remote-host
 
-4. Commands are now logged to `~/.history_all` on your local machine.
+# With SSH options
+ssh-agent-history --setup -p 2222 -i ~/.ssh/key user@remote-host
+
+# Preview what would be done
+ssh-agent-history --setup --dry-run user@remote-host
+```
 
 ## Configuration
 
@@ -84,9 +116,11 @@ Set it before starting the agent:
 AGENT_HISTFILE=~/my-agent-history eval $(./target/release/ssh-agent-history)
 ```
 
-## Remote setup (manual)
+## Manual remote setup
 
-If you prefer not to use `remote-setup.sh`, install `histsend` on the remote host (build with `cargo build --release -p histsend`, copy binary to PATH), then add to your remote host's `~/.bashrc`:
+If you prefer not to use `--setup`, install `histsend` on the remote host and add to the appropriate shell config:
+
+### Bash (`~/.bashrc`)
 
 ```bash
 __ha_history_trap() {
@@ -95,6 +129,27 @@ __ha_history_trap() {
     [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
 }
 trap __ha_history_trap DEBUG
+```
+
+### Zsh (`~/.zshrc`)
+
+```zsh
+__ha_history_trap() {
+    local _line
+    _line=$(fc -l -1)
+    [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
+}
+TRAPDEBUG=__ha_history_trap
+```
+
+### Fish (`~/.config/fish/conf.d/ssh-agent-history.fish`)
+
+```fish
+function __ha_history_preexec --on-event fish_preexec
+    if test -n "$argv[1]"
+        histsend $HOSTNAME $UID %self "$argv[1]"
+    end
+end
 ```
 
 ## Testing locally
@@ -110,10 +165,13 @@ export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
 ## Building
 
 ```bash
-# Debug build
-cargo build
+# Build everything (Zig client + Rust agent)
+zig build
 
-# Release build (optimized, stripped)
+# Build just the Zig client
+zig build zig
+
+# Build just the Rust agent
 cargo build --release
 
 # Run tests
@@ -123,9 +181,13 @@ cargo test
 ## Project structure
 
 ```
-crates/
-  agent/     — ssh-agent-history: the SSH agent server
-  client/    — histsend: the remote client binary
+build.zig                      — build orchestrator
+src/zig_tool/main.zig          — Zig client (histsend)
+crates/agent/
+  src/main.rs                  — agent entry point
+  src/agent.rs                 — Session impl with keyring + history
+  src/setup.rs                 — remote setup logic
+  build.rs                     — embeds prebuilt clients
 ```
 
 ## License
