@@ -1,4 +1,4 @@
-# ssh-agent-history
+# boom-sshh
 
 An SSH agent that logs command history from remote hosts via the SSH agent protocol extension mechanism.
 
@@ -31,8 +31,8 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 With [mise](https://mise.jdx.dev):
 
 ```bash
-git clone https://github.com/boormat/ssh-agent-history.git
-cd ssh-agent-history
+git clone https://github.com/boormat/boom-sshh.git
+cd boom-sshh
 mise install
 zig build
 ```
@@ -50,7 +50,7 @@ This builds the Zig client for all platforms and the Rust agent with embedded cl
 1. Run the agent locally:
 
 ```bash
-eval $(./target/release/ssh-agent-history)
+eval $(./target/release/boom-sshh)
 ```
 
 This prints `SSH_AUTH_SOCK=...; export SSH_AUTH_SOCK;` and starts the agent.
@@ -58,10 +58,10 @@ This prints `SSH_AUTH_SOCK=...; export SSH_AUTH_SOCK;` and starts the agent.
 2. Set up a remote host:
 
 ```bash
-./target/release/ssh-agent-history --setup user@remote-host
+./target/release/boom-sshh --setup user@remote-host
 ```
 
-This detects the remote shell, installs `histsend`, and injects the trap into `~/.bashrc` (or `~/.zshrc`, `~/.config/fish/config.fish` if they exist).
+This detects the remote shell, installs `boom-sshsend`, and injects the trap into `~/.bashrc` (or `~/.zshrc`, `~/.config/fish/config.fish` if they exist).
 
 3. SSH to the remote with agent forwarding:
 
@@ -75,33 +75,33 @@ ssh -A user@remote-host
 
 | Command | Description |
 |---|---|
-| `ssh-agent-history` | Start the agent |
-| `ssh-agent-history --setup <host>` | Setup remote host |
-| `ssh-agent-history --setup --dry-run <host>` | Preview setup (no changes) |
-| `ssh-agent-history --help` | Show help |
-| `ssh-agent-history --version` | Show version |
-| `ssh-agent-history --list-clients` | List embedded client architectures |
-| `ssh-agent-history --extract-client <arch> <path>` | Extract client binary |
+| `boom-sshh` | Start the agent |
+| `boom-sshh --setup <host>` | Setup remote host |
+| `boom-sshh --setup --dry-run <host>` | Preview setup (no changes) |
+| `boom-sshh --help` | Show help |
+| `boom-sshh --version` | Show version |
+| `boom-sshh --list-clients` | List embedded client architectures |
+| `boom-sshh --extract-client <arch> <path>` | Extract client binary |
 
 ### Setup
 
 `--setup` detects the remote shell and architecture, then:
 
-1. Installs `histsend` to `~/.local/bin/histsend` on the remote
+1. Installs `boom-sshsend` to `~/.local/bin/boom-sshsend` on the remote
 2. Injects the appropriate trap into each shell config file that exists:
    - `~/.bashrc` — bash trap
    - `~/.zshrc` — zsh trap
-   - `~/.config/fish/conf.d/ssh-agent-history.fish` — fish trap
+   - `~/.config/fish/conf.d/boom-sshh.fish` — fish trap
 
 ```bash
 # Basic setup
-ssh-agent-history --setup user@remote-host
+boom-sshh --setup user@remote-host
 
 # With SSH options
-ssh-agent-history --setup -p 2222 -i ~/.ssh/key user@remote-host
+boom-sshh --setup -p 2222 -i ~/.ssh/key user@remote-host
 
 # Preview what would be done
-ssh-agent-history --setup --dry-run user@remote-host
+boom-sshh --setup --dry-run user@remote-host
 ```
 
 ## Configuration
@@ -113,12 +113,12 @@ ssh-agent-history --setup --dry-run user@remote-host
 Set it before starting the agent:
 
 ```bash
-AGENT_HISTFILE=~/my-agent-history eval $(./target/release/ssh-agent-history)
+AGENT_HISTFILE=~/my-agent-history eval $(./target/release/boom-sshh)
 ```
 
 ## Manual remote setup
 
-If you prefer not to use `--setup`, install `histsend` on the remote host and add to the appropriate shell config:
+If you prefer not to use `--setup`, install `boom-sshsend` on the remote host and add to the appropriate shell config:
 
 ### Bash (`~/.bashrc`)
 
@@ -126,7 +126,7 @@ If you prefer not to use `--setup`, install `histsend` on the remote host and ad
 __ha_history_trap() {
     local _line
     _line=$(history 1)
-    [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
+    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
 }
 trap __ha_history_trap DEBUG
 ```
@@ -137,17 +137,17 @@ trap __ha_history_trap DEBUG
 __ha_history_trap() {
     local _line
     _line=$(fc -l -1)
-    [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
+    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
 }
 TRAPDEBUG=__ha_history_trap
 ```
 
-### Fish (`~/.config/fish/conf.d/ssh-agent-history.fish`)
+### Fish (`~/.config/fish/conf.d/boom-sshh.fish`)
 
 ```fish
 function __ha_history_preexec --on-event fish_preexec
     if test -n "$argv[1]"
-        histsend $HOSTNAME $UID %self "$argv[1]"
+        boom-sshsend $HOSTNAME $UID %self "$argv[1]"
     end
 end
 ```
@@ -158,7 +158,7 @@ You can test without SSH by setting `TEST_SSH_AUTH_SOCK`:
 
 ```bash
 export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
-./target/release/ssh-agent-history &
+./target/release/boom-sshh &
 # agent listens on /tmp/test-agent.sock instead of a random path
 ```
 
@@ -182,7 +182,7 @@ cargo test
 
 ```
 build.zig                      — build orchestrator
-src/zig_tool/main.zig          — Zig client (histsend)
+src/zig_tool/main.zig          — Zig client (boom-sshsend)
 crates/agent/
   src/main.rs                  — agent entry point
   src/agent.rs                 — Session impl with keyring + history

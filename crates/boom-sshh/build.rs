@@ -22,8 +22,8 @@ fn main() {
     ];
 
     for (zig_triple, client_name) in &targets {
-        let src = prebuilt_dir.join(zig_triple).join("histsend");
-        let dst = out_dir.join(format!("histsend-{client_name}"));
+        let src = prebuilt_dir.join(zig_triple).join("boom-sshsend");
+        let dst = out_dir.join(format!("boom-sshsend-{client_name}"));
 
         if src.exists() {
             fs::copy(&src, &dst).unwrap_or_else(|e| {

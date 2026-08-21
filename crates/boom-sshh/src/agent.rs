@@ -201,7 +201,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_histfile() -> (File, PathBuf) {
-        let dir = std::env::temp_dir().join("ssh-agent-history-test");
+        let dir = std::env::temp_dir().join("boom-sshh-test");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join(format!("test-{}-{}", std::process::id(), rand::random::<u32>()));
         let _ = fs::remove_file(&path);

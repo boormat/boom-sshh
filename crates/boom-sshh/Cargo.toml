@@ -1,11 +1,11 @@
 [package]
-name = "ssh-agent-history"
+name = "boom-sshh"
 version = "0.1.0"
 edition = "2021"
 description = "SSH agent with HISTORY extension for logging remote commands"
 
 [[bin]]
-name = "ssh-agent-history"
+name = "boom-sshh"
 path = "src/main.rs"
 
 [dependencies]

@@ -106,6 +106,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "boom-sshh"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ed25519-dalek",
+ "env_logger",
+ "log",
+ "rand",
+ "rsa",
+ "sha1",
+ "sha2",
+ "ssh-agent-lib",
+ "ssh-key",
+ "tokio",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -997,23 +1014,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "ssh-agent-history"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ed25519-dalek",
- "env_logger",
- "log",
- "rand",
- "rsa",
- "sha1",
- "sha2",
- "ssh-agent-lib",
- "ssh-key",
- "tokio",
 ]
 
 [[package]]

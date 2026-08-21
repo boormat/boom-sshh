@@ -8,7 +8,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         return error.EnvNotFound;
     };
 
-    // 2. Collect args: histsend <hostname> <uid> <pid> <command...>
+    // 2. Collect args: boom-sshsend <hostname> <uid> <pid> <command...>
     var args = minimal.args.iterate();
     _ = args.next(); // skip argv[0]
 
@@ -26,7 +26,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     }
 
     if (pos == 0) {
-        std.debug.print("usage: histsend <hostname> <uid> <pid> <command...>\n", .{});
+        std.debug.print("usage: boom-sshsend <hostname> <uid> <pid> <command...>\n", .{});
         return error.MissingArgs;
     }
 

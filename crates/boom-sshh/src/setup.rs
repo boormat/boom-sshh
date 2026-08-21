@@ -1,49 +1,48 @@
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
 
 struct RemoteInfo {
     arch: String,
-    histsend_installed: bool,
+    client_installed: bool,
     bashrc: bool,
     zshrc: bool,
     fish_config: bool,
 }
 
-const BASH_BLOCK: &str = r#"# ssh-agent-history begin
+const BASH_BLOCK: &str = r#"# boom-sshh begin
 __ha_history_trap() {
     local _line
     _line=$(history 1)
-    [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
+    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
 }
 trap __ha_history_trap DEBUG
-# ssh-agent-history end"#;
+# boom-sshh end"#;
 
-const ZSH_BLOCK: &str = r#"# ssh-agent-history begin
+const ZSH_BLOCK: &str = r#"# boom-sshh begin
 __ha_history_trap() {
     local _line
     _line=$(fc -l -1)
-    [[ -n "$_line" ]] && histsend "$HOSTNAME" "$UID" "$$" "$_line"
+    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
 }
 TRAPDEBUG=__ha_history_trap
-# ssh-agent-history end"#;
+# boom-sshh end"#;
 
-const FISH_BLOCK: &str = r#"# ssh-agent-history begin
+const FISH_BLOCK: &str = r#"# boom-sshh begin
 function __ha_history_preexec --on-event fish_preexec
     if test -n "$argv[1]"
-        histsend $HOSTNAME $UID %self "$argv[1]"
+        boom-sshsend $HOSTNAME $UID %self "$argv[1]"
     end
 end
-# ssh-agent-history end"#;
+# boom-sshh end"#;
 
 pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
-        eprintln!("usage: ssh-agent-history --setup [--dry-run] <ssh-args...> <host>");
+        eprintln!("usage: boom-sshh --setup [--dry-run] <ssh-args...> <host>");
         eprintln!();
         eprintln!("Examples:");
-        eprintln!("  ssh-agent-history --setup user@remote-host");
-        eprintln!("  ssh-agent-history --setup -p 2222 user@remote-host");
-        eprintln!("  ssh-agent-history --setup --dry-run user@remote-host");
+        eprintln!("  boom-sshh --setup user@remote-host");
+        eprintln!("  boom-sshh --setup -p 2222 user@remote-host");
+        eprintln!("  boom-sshh --setup --dry-run user@remote-host");
         std::process::exit(1);
     }
 
@@ -84,7 +83,7 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
         configs.push(("~/.zshrc", ZSH_BLOCK));
     }
     if info.fish_config {
-        configs.push(("~/.config/fish/conf.d/ssh-agent-history.fish", FISH_BLOCK));
+        configs.push(("~/.config/fish/conf.d/boom-sshh.fish", FISH_BLOCK));
     }
 
     if configs.is_empty() {
@@ -93,11 +92,11 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
         std::process::exit(1);
     }
 
-    // Check if histsend needs installation
-    if info.histsend_installed {
-        println!("histsend: already installed");
+    // Check if boom-sshsend needs installation
+    if info.client_installed {
+        println!("boom-sshsend: already installed");
     } else {
-        println!("histsend: not installed");
+        println!("boom-sshsend: not installed");
     }
 
     for (path, _) in &configs {
@@ -111,9 +110,9 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Extract client to temp file
-    let tmp_dir = std::env::temp_dir().join("ssh-agent-history-setup");
+    let tmp_dir = std::env::temp_dir().join("boom-sshh-setup");
     fs::create_dir_all(&tmp_dir)?;
-    let client_path = tmp_dir.join("histsend");
+    let client_path = tmp_dir.join("boom-sshsend");
 
     let client_bytes = match client_arch {
         "x86_64-linux" => super::CLIENT_X86_64_LINUX,
@@ -137,10 +136,10 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
     }
 
     println!();
-    println!("installing histsend...");
+    println!("installing boom-sshsend...");
 
     // SCP to remote — convert -p PORT to -P PORT for scp
-    let remote_path = format!("{host}:~/.local/bin/histsend");
+    let remote_path = format!("{host}:~/.local/bin/boom-sshsend");
     let mut scp_args: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < ssh_args.len() {
@@ -169,29 +168,29 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
 
     let status = Command::new("scp").args(&scp_args).status()?;
     if !status.success() {
-        eprintln!("error: failed to copy histsend to remote");
+        eprintln!("error: failed to copy boom-sshsend to remote");
         std::process::exit(1);
     }
 
     // Make executable
     let mut chmod_args: Vec<&str> = Vec::new();
     chmod_args.extend(ssh_args.iter());
-    chmod_args.extend(["-q", host, "--", "chmod", "+x", "~/.local/bin/histsend"]);
+    chmod_args.extend(["-q", host, "--", "chmod", "+x", "~/.local/bin/boom-sshsend"]);
 
     let status = Command::new("ssh").args(&chmod_args).status()?;
     if !status.success() {
-        eprintln!("error: failed to chmod histsend on remote");
+        eprintln!("error: failed to chmod boom-sshsend on remote");
         std::process::exit(1);
     }
 
-    println!("histsend installed to ~/.local/bin/histsend");
+    println!("boom-sshsend installed to ~/.local/bin/boom-sshsend");
 
     // Inject trap blocks
     for (path, block) in &configs {
         println!("injecting trap into {path}...");
 
         // Check if already configured
-        let check_cmd = format!("grep -q 'ssh-agent-history begin' {path} 2>/dev/null");
+        let check_cmd = format!("grep -q 'boom-sshh begin' {path} 2>/dev/null");
         let already_configured = ssh_exec(ssh_args, host, &check_cmd).is_ok();
 
         if already_configured {
@@ -232,8 +231,8 @@ fn detect_remote(
     let arch = ssh_exec(ssh_args, host, "uname -m")?;
     let arch = arch.trim().to_string();
 
-    // Check if histsend is installed
-    let histsend_installed = ssh_exec(ssh_args, host, "which histsend >/dev/null 2>&1")
+    // Check if boom-sshsend is installed
+    let client_installed = ssh_exec(ssh_args, host, "which boom-sshsend >/dev/null 2>&1")
         .map(|_| true)
         .unwrap_or(false);
 
@@ -260,7 +259,7 @@ fn detect_remote(
 
     Ok(RemoteInfo {
         arch,
-        histsend_installed,
+        client_installed,
         bashrc,
         zshrc,
         fish_config,

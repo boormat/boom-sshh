@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
         });
 
         const exe = b.addExecutable(.{
-            .name = "histsend",
+            .name = "boom-sshsend",
             .root_module = zig_mod,
         });
 

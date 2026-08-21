@@ -11,15 +11,15 @@ use ssh_agent_lib::agent::listen;
 use crate::agent::HistoryAgent;
 
 // Embedded client binaries (built by build.rs from zig-out/)
-// Each is a prebuilt histsend binary for a specific architecture
+// Each is a prebuilt boom-sshsend binary for a specific architecture
 const CLIENT_X86_64_LINUX: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/histsend-x86_64-linux"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-x86_64-linux"));
 const CLIENT_AARCH64_LINUX: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/histsend-aarch64-linux"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-aarch64-linux"));
 const CLIENT_X86_64_MACOS: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/histsend-x86_64-macos"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-x86_64-macos"));
 const CLIENT_AARCH64_MACOS: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/histsend-aarch64-macos"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-aarch64-macos"));
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some("--version") | Some("-V") => {
-            println!("ssh-agent-history {}", env!("CARGO_PKG_VERSION"));
+            println!("boom-sshh {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("--extract-client") => extract_client(&args[2..]),
@@ -54,18 +54,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("ssh-agent-history — SSH agent with HISTORY extension for logging remote commands");
+    println!("boom-sshh — SSH agent with HISTORY extension for logging remote commands");
     println!();
     println!("Usage:");
-    println!("  ssh-agent-history                                     Start the agent");
-    println!("  ssh-agent-history --setup <host>                      Setup remote host");
-    println!("  ssh-agent-history --setup --dry-run <host>            Preview setup (no changes)");
-    println!("  ssh-agent-history --help                              Show this help");
-    println!("  ssh-agent-history --version                           Show version");
-    println!("  ssh-agent-history --list-clients                      List embedded clients");
-    println!("  ssh-agent-history --extract-client <arch> <path>      Extract client binary");
+    println!("  boom-sshh                                     Start the agent");
+    println!("  boom-sshh --setup <host>                      Setup remote host");
+    println!("  boom-sshh --setup --dry-run <host>            Preview setup (no changes)");
+    println!("  boom-sshh --help                              Show this help");
+    println!("  boom-sshh --version                           Show version");
+    println!("  boom-sshh --list-clients                      List embedded clients");
+    println!("  boom-sshh --extract-client <arch> <path>      Extract client binary");
     println!();
-    println!("Setup detects remote shell (bash/zsh/fish), installs histsend,");
+    println!("Setup detects remote shell (bash/zsh/fish), installs boom-sshsend,");
     println!("and injects the appropriate trap into shell config files.");
     println!();
     println!("Environment variables:");
@@ -75,15 +75,15 @@ fn print_help() {
     println!("  TEST_SSH_AUTH_SOCK     Override socket path (for testing)");
     println!();
     println!("Examples:");
-    println!("  eval $(ssh-agent-history)");
-    println!("  ssh-agent-history --setup user@remote-host");
-    println!("  ssh-agent-history --setup -p 2222 user@remote-host");
-    println!("  ssh-agent-history --setup --dry-run user@remote-host");
+    println!("  eval $(boom-sshh)");
+    println!("  boom-sshh --setup user@remote-host");
+    println!("  boom-sshh --setup -p 2222 user@remote-host");
+    println!("  boom-sshh --setup --dry-run user@remote-host");
 }
 
 fn extract_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 2 {
-        eprintln!("usage: ssh-agent-history --extract-client <arch> <path>");
+        eprintln!("usage: boom-sshh --extract-client <arch> <path>");
         eprintln!();
         eprintln!("Available architectures:");
         list_clients();
@@ -154,7 +154,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error>> {
         let _ = fs::remove_file(&test_sock);
         test_sock
     } else {
-        let tmp_dir = std::env::temp_dir().join(format!("ssh-agent-history-{pid}"));
+        let tmp_dir = std::env::temp_dir().join(format!("boom-sshh-{pid}"));
         fs::create_dir_all(&tmp_dir)?;
         tmp_dir.join(format!("agent.{pid}")).to_str().unwrap().to_string()
     };
