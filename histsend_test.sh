@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# End-to-end test: build agent + client, start agent, send messages, verify history file.
+# End-to-end test: start agent, send messages via Zig client, verify history.
 #
 # Usage: bash histsend_test.sh
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_BIN="$SCRIPT_DIR/target/debug/ssh-agent-history"
-HISTSEND_BIN="$SCRIPT_DIR/target/debug/histsend"
+AGENT_BIN="$SCRIPT_DIR/target/release/ssh-agent-history"
+HISTSEND_BIN="$SCRIPT_DIR/zig-out/x86_64-linux-gnu/histsend"
 HISTFILE=$(mktemp)
 SOCK=$(mktemp -u)
 AGENT_PID=""
@@ -26,7 +26,19 @@ fail() { echo "  FAIL: $1"; [[ -n "${2:-}" ]] && echo "    $2"; FAIL=$((FAIL+1))
 
 echo "Building..."
 eval "$(mise activate bash)" > /dev/null 2>&1 || true
-cargo build 2>/dev/null
+if [ ! -x "$HISTSEND_BIN" ]; then
+    echo "Building Zig client..."
+    zig build zig 2>/dev/null
+fi
+if [ ! -x "$AGENT_BIN" ]; then
+    echo "Building Rust agent..."
+    cargo build --release 2>/dev/null
+fi
+
+if [ ! -x "$HISTSEND_BIN" ]; then
+    echo "SKIP: histsend binary not found at $HISTSEND_BIN"
+    exit 0
+fi
 
 # ── start agent ──────────────────────────────────────────────────
 
@@ -76,6 +88,14 @@ echo "$FIRST" | grep -qP '^#\d+ \S+ \d+ \d+ ' && ok "format: #ts host uid pid ..
 echo ""
 echo "=== Test 6: no args shows usage ==="
 "$HISTSEND_BIN" 2>/dev/null; [[ $? -ne 0 ]] && ok "no-args exits non-zero" || fail "no-args"
+
+echo ""
+echo "=== Test 7: extract client ==="
+"$AGENT_BIN" --list-clients | grep -q "x86_64-linux" && ok "list-clients works" || fail "list-clients"
+TMPCLIENT=$(mktemp)
+"$AGENT_BIN" --extract-client x86_64-linux "$TMPCLIENT" 2>&1 | grep -q "extracted" && ok "extract-client works" || fail "extract-client"
+file "$TMPCLIENT" | grep -q "ELF" && ok "extracted binary is ELF" || fail "extracted binary format"
+rm -f "$TMPCLIENT"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

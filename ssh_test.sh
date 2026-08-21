@@ -10,8 +10,8 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_BIN="$SCRIPT_DIR/target/debug/ssh-agent-history"
-HISTSEND_BIN="$SCRIPT_DIR/target/debug/histsend"
+AGENT_BIN="$SCRIPT_DIR/target/release/ssh-agent-history"
+HISTSEND_BIN="$SCRIPT_DIR/zig-out/x86_64-linux-gnu/histsend"
 PORT=2222
 
 # ── check prerequisites ─────────────────────────────────────────
