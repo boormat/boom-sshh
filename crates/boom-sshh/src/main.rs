@@ -1,5 +1,5 @@
 mod agent;
-mod setup;
+mod init;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -35,10 +35,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("--extract-client") => extract_client(&args[2..]),
         Some("--list-clients") => Ok(list_clients()),
-        Some("--setup") => setup::run_setup(&args[2..], false),
-        Some("--dry-run") | Some("-d") => {
-            let rest: Vec<String> = args[2..].iter().filter(|a| !a.starts_with('-')).cloned().collect();
-            setup::run_setup(&rest, true)
+        Some("--init") => {
+            let rest: Vec<String> = args[2..].iter().filter(|a| a.as_str() != "--dry-run" && a.as_str() != "-d").cloned().collect();
+            let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
+            init::run_init(&rest, dry_run)
+        }
+        Some("--init-agent") => {
+            let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
+            init::run_init_agent(dry_run)
         }
         Some(other) => {
             eprintln!("error: unknown argument '{other}'");
@@ -58,15 +62,20 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  boom-sshh                                     Start the agent");
-    println!("  boom-sshh --setup <host>                      Setup remote host");
-    println!("  boom-sshh --setup --dry-run <host>            Preview setup (no changes)");
+    println!("  boom-sshh --init <host>                       Init remote host");
+    println!("  boom-sshh --init --dry-run <host>             Preview remote init");
+    println!("  boom-sshh --init-agent                        Init local machine");
+    println!("  boom-sshh --init-agent --dry-run              Preview local init");
     println!("  boom-sshh --help                              Show this help");
     println!("  boom-sshh --version                           Show version");
     println!("  boom-sshh --list-clients                      List embedded clients");
     println!("  boom-sshh --extract-client <arch> <path>      Extract client binary");
     println!();
-    println!("Setup detects remote shell (bash/zsh/fish), installs boom-sshsend,");
+    println!("--init detects remote shell (bash/zsh/fish), installs boom-sshsend,");
     println!("and injects the appropriate trap into shell config files.");
+    println!();
+    println!("--init-agent sets up the local machine: launches agent via keychain");
+    println!("and adds the history trap to your shell config.");
     println!();
     println!("Environment variables:");
     println!("  SSH_AUTH_SOCK          Agent socket path (set automatically)");
@@ -76,9 +85,10 @@ fn print_help() {
     println!();
     println!("Examples:");
     println!("  eval $(boom-sshh)");
-    println!("  boom-sshh --setup user@remote-host");
-    println!("  boom-sshh --setup -p 2222 user@remote-host");
-    println!("  boom-sshh --setup --dry-run user@remote-host");
+    println!("  boom-sshh --init user@remote-host");
+    println!("  boom-sshh --init -p 2222 user@remote-host");
+    println!("  boom-sshh --init --dry-run user@remote-host");
+    println!("  boom-sshh --init-agent");
 }
 
 fn extract_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

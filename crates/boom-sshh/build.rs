@@ -18,7 +18,7 @@ fn main() {
         ("aarch64-linux-musl", "aarch64-linux"),
         ("x86_64-macos", "x86_64-macos"),
         ("aarch64-macos", "aarch64-macos"),
-        ("x86_64-windows-gnu", "x86_64-windows"),
+// not supported         ("x86_64-windows-gnu", "x86_64-windows"),
     ];
 
     for (zig_triple, client_name) in &targets {

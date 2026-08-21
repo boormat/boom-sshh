@@ -8,8 +8,8 @@ The agent runs locally and accepts standard SSH agent requests (key storage, sig
 
 ```
 ┌──────────┐   SSH agent protocol    ┌──────────────┐
-│ remote   │ ─────────────────────── │ ssh-agent-   │
-│ bash     │   HISTORY extension     │ history      │
+│ remote   │ ─────────────────────── │  boom-sshh   │
+│ bash     │   HISTORY extension     │              │
 │ (trap)   │   over forwarded sock   │ (Rust, local)│
 └──────────┘                         └──────┬───────┘
                                             │
@@ -26,13 +26,11 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 
 ## Install
 
-### From source
-
 With [mise](https://mise.jdx.dev):
 
 ```bash
-git clone https://github.com/boormat/boom-sshh.git
-cd boom-sshh
+git clone https://github.com/boormat/ssh-agent-history.git
+cd ssh-agent-history
 mise install
 zig build
 ```
@@ -43,7 +41,7 @@ Or with Rust + Zig already installed:
 zig build
 ```
 
-This builds the Zig client for all platforms and the Rust agent with embedded clients.
+This builds the Zig client (`boom-sshsend`) for all platforms and the Rust agent with embedded clients.
 
 ## Quick start
 
@@ -53,15 +51,11 @@ This builds the Zig client for all platforms and the Rust agent with embedded cl
 eval $(./target/release/boom-sshh)
 ```
 
-This prints `SSH_AUTH_SOCK=...; export SSH_AUTH_SOCK;` and starts the agent.
-
 2. Set up a remote host:
 
 ```bash
-./target/release/boom-sshh --setup user@remote-host
+./target/release/boom-sshh --init user@remote-host
 ```
-
-This detects the remote shell, installs `boom-sshsend`, and injects the trap into `~/.bashrc` (or `~/.zshrc`, `~/.config/fish/config.fish` if they exist).
 
 3. SSH to the remote with agent forwarding:
 
@@ -76,33 +70,42 @@ ssh -A user@remote-host
 | Command | Description |
 |---|---|
 | `boom-sshh` | Start the agent |
-| `boom-sshh --setup <host>` | Setup remote host |
-| `boom-sshh --setup --dry-run <host>` | Preview setup (no changes) |
+| `boom-sshh --init <host>` | Init remote host |
+| `boom-sshh --init --dry-run <host>` | Preview remote init |
+| `boom-sshh --init-agent` | Init local machine |
+| `boom-sshh --init-agent --dry-run` | Preview local init |
 | `boom-sshh --help` | Show help |
 | `boom-sshh --version` | Show version |
 | `boom-sshh --list-clients` | List embedded client architectures |
 | `boom-sshh --extract-client <arch> <path>` | Extract client binary |
 
-### Setup
+## `--init` (remote)
 
-`--setup` detects the remote shell and architecture, then:
-
-1. Installs `boom-sshsend` to `~/.local/bin/boom-sshsend` on the remote
-2. Injects the appropriate trap into each shell config file that exists:
-   - `~/.bashrc` — bash trap
-   - `~/.zshrc` — zsh trap
-   - `~/.config/fish/conf.d/boom-sshh.fish` — fish trap
+Detects remote shell (bash/zsh/fish), installs `boom-sshsend`, and injects the trap into shell config files.
 
 ```bash
-# Basic setup
-boom-sshh --setup user@remote-host
-
-# With SSH options
-boom-sshh --setup -p 2222 -i ~/.ssh/key user@remote-host
-
-# Preview what would be done
-boom-sshh --setup --dry-run user@remote-host
+boom-sshh --init user@remote-host
+boom-sshh --init -p 2222 user@remote-host
+boom-sshh --init --dry-run user@remote-host
 ```
+
+## `--init-agent` (local)
+
+Sets up the local machine:
+- Launches the agent via keychain on login
+- Adds the history trap to your shell config
+- Checks for existing agent/keychain and warns if detected
+
+```bash
+boom-sshh --init-agent
+boom-sshh --init-agent --dry-run
+```
+
+Pre-flight checks before modifying rc files:
+- Bails if keychain is already managing an agent
+- Bails if ssh-agent is running
+- Skips agent launch if boom-sshh is already running
+- Skips if already configured
 
 ## Configuration
 
@@ -110,15 +113,13 @@ boom-sshh --setup --dry-run user@remote-host
 |---|---|---|
 | `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
 
-Set it before starting the agent:
-
 ```bash
-AGENT_HISTFILE=~/my-agent-history eval $(./target/release/boom-sshh)
+AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh)
 ```
 
-## Manual remote setup
+## Manual setup
 
-If you prefer not to use `--setup`, install `boom-sshsend` on the remote host and add to the appropriate shell config:
+If you prefer not to use `--init`, install `boom-sshsend` on the remote host and add to the appropriate shell config:
 
 ### Bash (`~/.bashrc`)
 
@@ -154,12 +155,9 @@ end
 
 ## Testing locally
 
-You can test without SSH by setting `TEST_SSH_AUTH_SOCK`:
-
 ```bash
 export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
 ./target/release/boom-sshh &
-# agent listens on /tmp/test-agent.sock instead of a random path
 ```
 
 ## Building
@@ -183,10 +181,10 @@ cargo test
 ```
 build.zig                      — build orchestrator
 src/zig_tool/main.zig          — Zig client (boom-sshsend)
-crates/agent/
+crates/boom-sshh/
   src/main.rs                  — agent entry point
   src/agent.rs                 — Session impl with keyring + history
-  src/setup.rs                 — remote setup logic
+  src/init.rs                  — remote + local init logic
   build.rs                     — embeds prebuilt clients
 ```
 

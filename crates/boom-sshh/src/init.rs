@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 struct RemoteInfo {
@@ -35,19 +36,20 @@ function __ha_history_preexec --on-event fish_preexec
 end
 # boom-sshh end"#;
 
-pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+// ── --init (remote) ─────────────────────────────────────────────
+
+pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
-        eprintln!("usage: boom-sshh --setup [--dry-run] <ssh-args...> <host>");
+        eprintln!("usage: boom-sshh --init [--dry-run] <ssh-args...> <host>");
         eprintln!();
         eprintln!("Examples:");
-        eprintln!("  boom-sshh --setup user@remote-host");
-        eprintln!("  boom-sshh --setup -p 2222 user@remote-host");
-        eprintln!("  boom-sshh --setup --dry-run user@remote-host");
+        eprintln!("  boom-sshh --init user@remote-host");
+        eprintln!("  boom-sshh --init -p 2222 user@remote-host");
+        eprintln!("  boom-sshh --init --dry-run user@remote-host");
         std::process::exit(1);
     }
 
     // Filter out our own flags, pass rest to SSH
-    // Last argument is the host
     let filtered: Vec<&str> = args
         .iter()
         .filter(|a| *a != "--dry-run" && *a != "-d")
@@ -55,7 +57,7 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
         .collect();
 
     let host = filtered.last().ok_or("no host specified")?;
-    let ssh_args = &filtered[..filtered.len() - 1]; // everything except host
+    let ssh_args = &filtered[..filtered.len() - 1];
 
     println!("detecting remote {host}...");
     let info = detect_remote(&ssh_args, host)?;
@@ -92,7 +94,6 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
         std::process::exit(1);
     }
 
-    // Check if boom-sshsend needs installation
     if info.client_installed {
         println!("boom-sshsend: already installed");
     } else {
@@ -110,7 +111,7 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Extract client to temp file
-    let tmp_dir = std::env::temp_dir().join("boom-sshh-setup");
+    let tmp_dir = std::env::temp_dir().join("boom-sshh-init");
     fs::create_dir_all(&tmp_dir)?;
     let client_path = tmp_dir.join("boom-sshsend");
 
@@ -124,7 +125,6 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
 
     if client_bytes.is_empty() {
         eprintln!("error: client not embedded for {client_arch}");
-        eprintln!("build with: PREBUILT_CLIENTS_DIR=zig-out cargo build --release");
         std::process::exit(1);
     }
 
@@ -219,31 +219,230 @@ pub fn run_setup(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::erro
     let _ = fs::remove_dir_all(&tmp_dir);
 
     println!();
-    println!("setup complete! Restart your shell or run: source ~/.bashrc");
+    println!("init complete! Restart your shell or run: source ~/.bashrc");
     Ok(())
 }
+
+// ── --init-agent (local) ────────────────────────────────────────
+
+pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Detect local shell
+    let shell = detect_local_shell();
+    let shell_name = shell.rsplit('/').next().unwrap_or(&shell);
+
+    println!("shell: {shell_name}");
+
+    // Determine which config file to modify
+    let config_path = match shell_name {
+        "bash" => Some(dirs_or_default().join(".bashrc")),
+        "zsh" => Some(dirs_or_default().join(".zshrc")),
+        "fish" => Some(dirs_or_default().join(".config/fish/conf.d/boom-sshh.fish")),
+        _ => None,
+    };
+
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("error: unsupported shell: {shell_name}");
+            eprintln!("supported: bash, zsh, fish");
+            std::process::exit(1);
+        }
+    };
+
+    // Check if already configured
+    if config_path.exists() {
+        let contents = fs::read_to_string(&config_path).unwrap_or_default();
+        if contents.contains("boom-sshh begin") {
+            let display = config_path.to_str().unwrap_or("?");
+            println!("{display}: already configured — skipping");
+            return Ok(());
+        }
+    }
+
+    // Pre-flight checks
+    if check_keychain_running() {
+        eprintln!("error: keychain is already managing an agent");
+        eprintln!("edit your shell config manually to switch to boom-sshh");
+        std::process::exit(1);
+    }
+
+    if check_ssh_agent_running() {
+        eprintln!("error: ssh-agent is already running");
+        eprintln!("kill it first or edit your shell config manually");
+        std::process::exit(1);
+    }
+
+    // Determine what to install
+    let agent_running = check_boom_sshh_running() || check_ssh_auth_sock_valid();
+    let config_display = config_path.to_str().unwrap_or("?");
+
+    if agent_running {
+        println!("boom-sshh already running");
+        println!("{config_display}: will add trap only");
+    } else {
+        println!("{config_display}: will add agent launch + trap");
+    }
+
+    if dry_run {
+        println!();
+        println!("(dry run — no changes made)");
+        return Ok(());
+    }
+
+    // Build the block to inject
+    let block = match shell_name {
+        "bash" | "zsh" => build_local_bash_block(),
+        "fish" => build_local_fish_block(),
+        _ => unreachable!(),
+    };
+
+    // Ensure parent directory exists
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Append block
+    let mut contents = fs::read_to_string(&config_path).unwrap_or_default();
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&block);
+    contents.push('\n');
+    fs::write(&config_path, &contents)?;
+
+    println!("{config_display}: done");
+
+    println!();
+    println!("init-agent complete! Restart your shell or run: source {config_display}");
+    Ok(())
+}
+
+fn build_local_bash_block() -> String {
+    let mut block = String::from("# boom-sshh begin\n");
+
+    // Only add keychain launch if agent isn't already running
+    if !check_boom_sshh_running() && !check_ssh_auth_sock_valid() {
+        block.push_str("eval $(keychain --eval --agents ssh boom-sshh)\n");
+    }
+
+    block.push_str(
+        r#"
+__ha_history_trap() {
+    local _line
+    _line=$(history 1)
+    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
+}
+trap __ha_history_trap DEBUG
+"#,
+    );
+    block.push_str("# boom-sshh end\n");
+    block
+}
+
+fn build_local_fish_block() -> String {
+    let mut block = String::from("# boom-sshh begin\n");
+
+    if !check_boom_sshh_running() && !check_ssh_auth_sock_valid() {
+        block.push_str("eval (keychain --eval --agents ssh boom-sshh | source)\n");
+    }
+
+    block.push_str(
+        r#"
+function __ha_history_preexec --on-event fish_preexec
+    if test -n "$argv[1]"
+        boom-sshsend $HOSTNAME $UID %self "$argv[1]"
+    end
+end
+"#,
+    );
+    block.push_str("# boom-sshh end\n");
+    block
+}
+
+// ── pre-flight checks ───────────────────────────────────────────
+
+fn check_keychain_running() -> bool {
+    // Check if keychain is managing any agent
+    Command::new("keychain")
+        .args(["--list"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn check_ssh_agent_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "ssh-agent"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn check_boom_sshh_running() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "boom-sshh"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn check_ssh_auth_sock_valid() -> bool {
+    std::env::var("SSH_AUTH_SOCK")
+        .map(|sock| {
+            let path = std::path::Path::new(&sock);
+            if !path.exists() {
+                return false;
+            }
+            // Check if it's a socket using stat
+            Command::new("test")
+                .args(["-S", &sock])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+// ── local detection ─────────────────────────────────────────────
+
+fn detect_local_shell() -> String {
+    // Try $SHELL first
+    if let Ok(shell) = std::env::var("SHELL") {
+        return shell;
+    }
+
+    // Fallback to getent
+    Command::new("getent")
+        .args(["passwd"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            let user = std::env::var("USER").unwrap_or_default();
+            s.lines()
+                .find(|l| l.starts_with(&format!("{user}:")))
+                .and_then(|l| l.split(':').nth(6))
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+// ── remote detection ────────────────────────────────────────────
 
 fn detect_remote(
     ssh_args: &[&str],
     host: &str,
 ) -> Result<RemoteInfo, Box<dyn std::error::Error>> {
-    // Detect architecture
     let arch = ssh_exec(ssh_args, host, "uname -m")?;
     let arch = arch.trim().to_string();
 
-    // Check if boom-sshsend is installed
     let client_installed = ssh_exec(ssh_args, host, "which boom-sshsend >/dev/null 2>&1")
         .map(|_| true)
         .unwrap_or(false);
 
-    // Check which config files exist
-    let bashrc = ssh_exec(
-        ssh_args,
-        host,
-        "test -f ~/.bashrc && echo yes || echo no",
-    )
-    .map(|s| s.trim() == "yes")
-    .unwrap_or(false);
+    let bashrc = ssh_exec(ssh_args, host, "test -f ~/.bashrc && echo yes || echo no")
+        .map(|s| s.trim() == "yes")
+        .unwrap_or(false);
 
     let zshrc = ssh_exec(ssh_args, host, "test -f ~/.zshrc && echo yes || echo no")
         .map(|s| s.trim() == "yes")
@@ -286,4 +485,10 @@ fn ssh_exec(
     }
 
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn dirs_or_default() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
