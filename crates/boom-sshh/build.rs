@@ -12,13 +12,12 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root.join("zig-out"));
 
-    // Target triples to look for
+    // Target triples to look for — must match zig_triple in targets.zig
     let targets = [
-        ("x86_64-linux-gnu", "x86_64-linux"),
+        ("x86_64-linux-musl", "x86_64-linux"),
         ("aarch64-linux-musl", "aarch64-linux"),
         ("x86_64-macos", "x86_64-macos"),
         ("aarch64-macos", "aarch64-macos"),
-// not supported         ("x86_64-windows-gnu", "x86_64-windows"),
     ];
 
     for (zig_triple, client_name) in &targets {

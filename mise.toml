@@ -2,6 +2,4 @@
 zig = "latest"
 "github:kunobi-ninja/kache" = "latest"
 rust = { version = "latest", profile = "default" }
-
-[env]
-RUSTC_WRAPPER = "kache"
+"cargo:cargo-zigbuild" = "latest"

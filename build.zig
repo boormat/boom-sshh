@@ -1,26 +1,25 @@
 const std = @import("std");
+const cfg = @import("targets.zig");
 
 pub fn build(b: *std.Build) void {
-    // Target list: Zig client targets (cross-compile from any host)
-    const zig_targets = [_]std.Target.Query{
-        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
-        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
-        .{ .cpu_arch = .x86_64, .os_tag = .macos },
-        .{ .cpu_arch = .aarch64, .os_tag = .macos },
-    };
-
     const zig_out_base = b.pathFromRoot("zig-out");
 
-    // --- Step 1: Build histsend (Zig client) for all targets ---
+    // --- Target option for agent build ---
+    const resolved_target = b.standardTargetOptions(.{});
+    const is_native = resolved_target.query.isNative();
+
+    // --- Step 1: Build Zig clients for all targets ---
     var zig_step = b.step("zig", "Build Zig client for all targets");
 
-    for (zig_targets) |t| {
-        const target = b.resolveTargetQuery(t);
-        const triple = t.zigTriple(b.allocator) catch unreachable;
+    inline for (cfg.targets) |t| {
+        const query = std.Target.Query.parse(.{ .arch_os_abi = t.zig_triple }) catch
+            @panic("invalid zig triple in targets.zig: " ++ t.zig_triple);
+        const resolved = b.resolveTargetQuery(query);
+        const triple = query.zigTriple(b.allocator) catch unreachable;
 
         const zig_mod = b.createModule(.{
             .root_source_file = b.path("src/zig_tool/main.zig"),
-            .target = target,
+            .target = resolved,
             .optimize = .ReleaseSmall,
             .link_libc = true,
         });
@@ -37,37 +36,49 @@ pub fn build(b: *std.Build) void {
         zig_step.dependOn(&install.step);
     }
 
-    // --- Step 2: Build ssh-agent-history (Rust) for host only ---
-    var rust_step = b.step("rust", "Build Rust agent for host target");
+    // --- Step 2: Build Rust agent ---
+    var rust_step = b.step("rust", "Build Rust agent");
 
-    const cargo_cmd = b.addSystemCommand(&.{
-        "cargo",
-        "build",
-        "--release",
-    });
+    const rust_triple: []const u8 = if (is_native)
+        ""
+    else
+        findRustTriple(resolved_target.query) orelse
+            @panic("target not found in targets.zig: pass one of the supported zig triples");
 
+    const cargo_args: []const []const u8 = if (is_native)
+        &.{ "cargo", "zigbuild", "--release" }
+    else
+        &.{ "cargo", "zigbuild", "--release", "--target", rust_triple };
+
+    const cargo_cmd = b.addSystemCommand(cargo_args);
     cargo_cmd.setEnvironmentVariable("PREBUILT_CLIENTS_DIR", zig_out_base);
     rust_step.dependOn(&cargo_cmd.step);
+
+    // --- Step 3: List supported targets ---
+    const targets_buf = comptime blk: {
+        var buf: []const u8 = "";
+        for (cfg.targets) |t| {
+            buf = buf ++ t.zig_triple ++ " " ++ t.rust_triple ++ " " ++ t.bin_suffix ++ "\n";
+        }
+        break :blk buf;
+    };
+    const echo_cmd = b.addSystemCommand(&.{ "printf", "%s", targets_buf });
+    var targets_step = b.step("targets", "List supported build targets");
+    targets_step.dependOn(&echo_cmd.step);
 
     // --- Default: build both ---
     b.default_step.dependOn(zig_step);
     b.default_step.dependOn(rust_step);
 }
 
-/// Convert Zig triple to Rust triple.
-pub fn zigToRustTriple(zig_triple: []const u8) []const u8 {
-    const map = [_]struct{ zig: []const u8, rust: []const u8 }{
-        .{ .zig = "x86_64-linux-gnu", .rust = "x86_64-unknown-linux-gnu" },
-        .{ .zig = "aarch64-linux-gnu", .rust = "aarch64-unknown-linux-gnu" },
-        .{ .zig = "x86_64-linux-musl", .rust = "x86_64-unknown-linux-musl" },
-        .{ .zig = "aarch64-linux-musl", .rust = "aarch64-unknown-linux-musl" },
-        .{ .zig = "x86_64-macos", .rust = "x86_64-apple-darwin" },
-        .{ .zig = "aarch64-macos", .rust = "aarch64-apple-darwin" },
-        .{ .zig = "x86_64-windows-gnu", .rust = "x86_64-pc-windows-gnu" },
-    };
-
-    for (map) |entry| {
-        if (std.mem.eql(u8, zig_triple, entry.zig)) return entry.rust;
+/// Match the user-provided target query against our known targets by comparing
+/// cpu_arch, os_tag, and abi fields (avoids string-roundtrip issues with zigTriple).
+fn findRustTriple(query: std.Target.Query) ?[]const u8 {
+    inline for (cfg.targets) |t| {
+        const known = std.Target.Query.parse(.{ .arch_os_abi = t.zig_triple }) catch unreachable;
+        if (query.cpu_arch == known.cpu_arch and query.os_tag == known.os_tag and
+            query.abi == known.abi)
+            return t.rust_triple;
     }
-    return zig_triple;
+    return null;
 }

@@ -10,54 +10,68 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
+    name: Build all targets
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: jdx/mise-action@v2
         with:
-          go-version: "1.21"
-
-      - name: Build
+          install: true
+          cache: true
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          EXT=""
-          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
-          go build -ldflags="-s -w" -o "ssh-agent-history-${GOOS}-${GOARCH}${EXT}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MISE_HTTP_TIMEOUT: "120"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Read target list
+        run: zig build targets > targets.list
+
+      - name: Add Rust cross-compilation targets
+        run: |
+          while read -r zig_triple rust_triple bin_suffix; do
+            rustup target add "$rust_triple"
+          done < targets.list
+
+      - name: Build all targets
+        env:
+          RUSTC_WRAPPER: ""
+        run: |
+          while read -r zig_triple rust_triple bin_suffix; do
+            echo "::group::Build ${bin_suffix}"
+            zig build -Dtarget="${zig_triple}"
+            cp "target/${rust_triple}/release/boom-sshh" "boom-sshh-${bin_suffix}"
+            echo "::endgroup::"
+          done < targets.list
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: ssh-agent-history-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ssh-agent-history-*
+          name: release-binaries
+          path: boom-sshh-*
 
   release:
+    name: Publish
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      - name: Download binaries
         uses: actions/download-artifact@v4
         with:
+          name: release-binaries
           path: dist
-          merge-multiple: true
+
+      - name: Add install script + checksums
+        run: |
+          chmod +x install.sh
+          cp install.sh dist/install.sh
+          cd dist && sha256sum boom-sshh-* > checksums.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/*
+          files: |
+            dist/boom-sshh-*
+            dist/checksums.txt
+            dist/install.sh
