@@ -1,4 +1,6 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -10,31 +12,33 @@ struct RemoteInfo {
     fish_config: bool,
 }
 
-const BASH_BLOCK: &str = r#"# boom-sshh begin
-__ha_history_trap() {
-    local _line
-    _line=$(history 1)
-    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
+/// Build the shell snippet that sends each command via `boom-sshend`.
+/// `with_keychain` adds the local agent auto-start (keychain launches `boom-sshh`),
+/// used only by `--init-agent`; the remote installer never launches an agent.
+fn build_trap_block(shell: &str, with_keychain: bool) -> String {
+    let mut block = String::new();
+    if with_keychain {
+        match shell {
+            "fish" => block.push_str("eval (keychain --eval --agents ssh boom-sshh | source)\n"),
+            _ => block.push_str("eval $(keychain --eval --agents ssh boom-sshh)\n"),
+        }
+    }
+    match shell {
+        "fish" => block.push_str(
+            "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend $HOSTNAME $UID %self \"$argv[1]\"\n    end\nend\n",
+        ),
+        "zsh" => block.push_str(
+            "__boomssh_trap() {\n    local _line\n    _line=$(fc -l -1)\n    [[ -n \"$_line\" ]] && boom-sshend \"$HOSTNAME\" \"$UID\" \"$$\" \"$_line\"\n}\nTRAPDEBUG=__boomssh_trap\n",
+        ),
+        _ => block.push_str(
+            "__boomssh_trap() {\n    local _line\n    _line=$(history 1)\n    [[ -n \"$_line\" ]] && boom-sshend \"$HOSTNAME\" \"$UID\" \"$$\" \"$_line\"\n}\ntrap __boomssh_trap DEBUG\n",
+        ),
+    }
+    block
 }
-trap __ha_history_trap DEBUG
-# boom-sshh end"#;
 
-const ZSH_BLOCK: &str = r#"# boom-sshh begin
-__ha_history_trap() {
-    local _line
-    _line=$(fc -l -1)
-    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
-}
-TRAPDEBUG=__ha_history_trap
-# boom-sshh end"#;
-
-const FISH_BLOCK: &str = r#"# boom-sshh begin
-function __ha_history_preexec --on-event fish_preexec
-    if test -n "$argv[1]"
-        boom-sshsend $HOSTNAME $UID %self "$argv[1]"
-    end
-end
-# boom-sshh end"#;
+/// Token present in every injected block; used to detect an already-configured shell.
+const CONFIG_SENTINEL: &str = "boom-sshend";
 
 // ── --init (remote) ─────────────────────────────────────────────
 
@@ -77,15 +81,18 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     println!("client: {client_arch}");
 
     // Determine which config files to inject into
-    let mut configs: Vec<(&str, &str)> = Vec::new();
+    let mut configs: Vec<(&str, String)> = Vec::new();
     if info.bashrc {
-        configs.push(("~/.bashrc", BASH_BLOCK));
+        configs.push(("~/.bashrc", build_trap_block("bash", false)));
     }
     if info.zshrc {
-        configs.push(("~/.zshrc", ZSH_BLOCK));
+        configs.push(("~/.zshrc", build_trap_block("zsh", false)));
     }
     if info.fish_config {
-        configs.push(("~/.config/fish/conf.d/boom-sshh.fish", FISH_BLOCK));
+        configs.push((
+            "~/.config/fish/conf.d/boom-sshh.fish",
+            build_trap_block("fish", false),
+        ));
     }
 
     if configs.is_empty() {
@@ -95,9 +102,9 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     }
 
     if info.client_installed {
-        println!("boom-sshsend: already installed");
+        println!("boom-sshend: already installed");
     } else {
-        println!("boom-sshsend: not installed");
+        println!("boom-sshend: not installed");
     }
 
     for (path, _) in &configs {
@@ -113,7 +120,7 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     // Extract client to temp file
     let tmp_dir = std::env::temp_dir().join("boom-sshh-init");
     fs::create_dir_all(&tmp_dir)?;
-    let client_path = tmp_dir.join("boom-sshsend");
+    let client_path = tmp_dir.join("boom-sshend");
 
     let client_bytes = match client_arch {
         "x86_64-linux" => super::CLIENT_X86_64_LINUX,
@@ -136,10 +143,10 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     }
 
     println!();
-    println!("installing boom-sshsend...");
+    println!("installing boom-sshend...");
 
     // SCP to remote — convert -p PORT to -P PORT for scp
-    let remote_path = format!("{host}:~/.local/bin/boom-sshsend");
+    let remote_path = format!("{host}:~/.local/bin/boom-sshend");
     let mut scp_args: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < ssh_args.len() {
@@ -168,29 +175,29 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
 
     let status = Command::new("scp").args(&scp_args).status()?;
     if !status.success() {
-        eprintln!("error: failed to copy boom-sshsend to remote");
+        eprintln!("error: failed to copy boom-sshend to remote");
         std::process::exit(1);
     }
 
     // Make executable
     let mut chmod_args: Vec<&str> = Vec::new();
     chmod_args.extend(ssh_args.iter());
-    chmod_args.extend(["-q", host, "--", "chmod", "+x", "~/.local/bin/boom-sshsend"]);
+    chmod_args.extend(["-q", host, "--", "chmod", "+x", "~/.local/bin/boom-sshend"]);
 
     let status = Command::new("ssh").args(&chmod_args).status()?;
     if !status.success() {
-        eprintln!("error: failed to chmod boom-sshsend on remote");
+        eprintln!("error: failed to chmod boom-sshend on remote");
         std::process::exit(1);
     }
 
-    println!("boom-sshsend installed to ~/.local/bin/boom-sshsend");
+    println!("boom-sshend installed to ~/.local/bin/boom-sshend");
 
     // Inject trap blocks
     for (path, block) in &configs {
         println!("injecting trap into {path}...");
 
         // Check if already configured
-        let check_cmd = format!("grep -q 'boom-sshh begin' {path} 2>/dev/null");
+        let check_cmd = format!("grep -q '{CONFIG_SENTINEL}' {path} 2>/dev/null");
         let already_configured = ssh_exec(ssh_args, host, &check_cmd).is_ok();
 
         if already_configured {
@@ -252,35 +259,38 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Check if already configured
     if config_path.exists() {
         let contents = fs::read_to_string(&config_path).unwrap_or_default();
-        if contents.contains("boom-sshh begin") {
+        if contents.contains(CONFIG_SENTINEL) {
             let display = config_path.to_str().unwrap_or("?");
             println!("{display}: already configured — skipping");
             return Ok(());
         }
     }
 
-    // Pre-flight checks
+    // Pre-flight conflict checks — warn only (non-fatal)
     if check_keychain_running() {
-        eprintln!("error: keychain is already managing an agent");
-        eprintln!("edit your shell config manually to switch to boom-sshh");
-        std::process::exit(1);
+        eprintln!("warning: keychain is already managing an agent; boom-sshh may not be the active agent");
     }
-
     if check_ssh_agent_running() {
-        eprintln!("error: ssh-agent is already running");
-        eprintln!("kill it first or edit your shell config manually");
-        std::process::exit(1);
+        eprintln!("warning: ssh-agent is already running; boom-sshh may not be the active agent");
     }
+    warn_config_conflicts(&config_path);
 
     // Determine what to install
     let agent_running = check_boom_sshh_running() || check_ssh_auth_sock_valid();
+    let keychain_avail = keychain_available();
+    let mut with_keychain = false;
     let config_display = config_path.to_str().unwrap_or("?");
 
     if agent_running {
         println!("boom-sshh already running");
         println!("{config_display}: will add trap only");
-    } else {
+    } else if keychain_avail {
+        with_keychain = true;
         println!("{config_display}: will add agent launch + trap");
+    } else {
+        eprintln!("warning: keychain not found in PATH; cannot auto-start boom-sshh");
+        eprintln!("         install keychain, or start the agent manually, then reload your shell");
+        println!("{config_display}: will add trap only");
     }
 
     if dry_run {
@@ -289,12 +299,11 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Install the boom-sshend client locally so the trap can send history
+    install_local_client()?;
+
     // Build the block to inject
-    let block = match shell_name {
-        "bash" | "zsh" => build_local_bash_block(),
-        "fish" => build_local_fish_block(),
-        _ => unreachable!(),
-    };
+    let block = build_trap_block(shell_name, with_keychain);
 
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
@@ -315,48 +324,6 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("init-agent complete! Restart your shell or run: source {config_display}");
     Ok(())
-}
-
-fn build_local_bash_block() -> String {
-    let mut block = String::from("# boom-sshh begin\n");
-
-    // Only add keychain launch if agent isn't already running
-    if !check_boom_sshh_running() && !check_ssh_auth_sock_valid() {
-        block.push_str("eval $(keychain --eval --agents ssh boom-sshh)\n");
-    }
-
-    block.push_str(
-        r#"
-__ha_history_trap() {
-    local _line
-    _line=$(history 1)
-    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
-}
-trap __ha_history_trap DEBUG
-"#,
-    );
-    block.push_str("# boom-sshh end\n");
-    block
-}
-
-fn build_local_fish_block() -> String {
-    let mut block = String::from("# boom-sshh begin\n");
-
-    if !check_boom_sshh_running() && !check_ssh_auth_sock_valid() {
-        block.push_str("eval (keychain --eval --agents ssh boom-sshh | source)\n");
-    }
-
-    block.push_str(
-        r#"
-function __ha_history_preexec --on-event fish_preexec
-    if test -n "$argv[1]"
-        boom-sshsend $HOSTNAME $UID %self "$argv[1]"
-    end
-end
-"#,
-    );
-    block.push_str("# boom-sshh end\n");
-    block
 }
 
 // ── pre-flight checks ───────────────────────────────────────────
@@ -403,6 +370,84 @@ fn check_ssh_auth_sock_valid() -> bool {
         .unwrap_or(false)
 }
 
+/// Warn about other agent-launch mechanisms present in the shell config so the
+/// user is aware of possible conflicts with the boom-sshh keychain startup.
+fn warn_config_conflicts(path: &Path) {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    for pat in ["ssh-agent", "keychain", "gpg-agent", "fish_ssh_agent", "ssh-add"] {
+        if contents.contains(pat) {
+            eprintln!(
+                "warning: {} contains '{}' — possible conflicting agent startup",
+                path.display(),
+                pat
+            );
+        }
+    }
+}
+
+/// True if `keychain` is available on PATH (needed to auto-start boom-sshh).
+fn keychain_available() -> bool {
+    Command::new("sh")
+        .args(["-c", "command -v keychain >/dev/null 2>&1"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Pick the embedded client bytes matching the local OS/arch.
+fn local_client_bytes() -> Option<&'static [u8]> {
+    let os = Command::new("uname")
+        .args(["-s"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let arch = Command::new("uname")
+        .args(["-m"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match (os.as_deref(), arch.as_deref()) {
+        (Some("Linux"), Some("x86_64") | Some("amd64")) => Some(super::CLIENT_X86_64_LINUX),
+        (Some("Linux"), Some("aarch64") | Some("arm64")) => Some(super::CLIENT_AARCH64_LINUX),
+        (Some("Darwin"), Some("x86_64") | Some("amd64")) => Some(super::CLIENT_X86_64_MACOS),
+        (Some("Darwin"), Some("aarch64") | Some("arm64")) => Some(super::CLIENT_AARCH64_MACOS),
+        _ => None,
+    }
+}
+
+/// Install the boom-sshend client locally so the injected trap can send history.
+/// Mirrors the remote installer but writes to a local bin directory.
+fn install_local_client() -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = match local_client_bytes() {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            eprintln!(
+                "warning: no embedded boom-sshend client for this platform; skipping local client install"
+            );
+            return Ok(());
+        }
+    };
+
+    // Prefer /usr/local/bin when writable, else ~/.local/bin.
+    let install_dir: PathBuf = if fs::write("/usr/local/bin/.boom-sshh-write-test", b"").is_ok() {
+        let _ = fs::remove_file("/usr/local/bin/.boom-sshh-write-test");
+        PathBuf::from("/usr/local/bin")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let dir = PathBuf::from(home).join(".local/bin");
+        fs::create_dir_all(&dir)?;
+        dir
+    };
+
+    let dest = install_dir.join("boom-sshend");
+    fs::write(&dest, bytes)?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+    println!("installed {dest:?}");
+    Ok(())
+}
+
 // ── local detection ─────────────────────────────────────────────
 
 fn detect_local_shell() -> String {
@@ -436,7 +481,7 @@ fn detect_remote(
     let arch = ssh_exec(ssh_args, host, "uname -m")?;
     let arch = arch.trim().to_string();
 
-    let client_installed = ssh_exec(ssh_args, host, "which boom-sshsend >/dev/null 2>&1")
+    let client_installed = ssh_exec(ssh_args, host, "which boom-sshend >/dev/null 2>&1")
         .map(|_| true)
         .unwrap_or(false);
 

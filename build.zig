@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
         });
 
         const exe = b.addExecutable(.{
-            .name = "boom-sshsend",
+            .name = "boom-sshend",
             .root_module = zig_mod,
         });
 
@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
 
     const cargo_cmd = b.addSystemCommand(cargo_args);
     cargo_cmd.setEnvironmentVariable("PREBUILT_CLIENTS_DIR", zig_out_base);
+    rust_step.dependOn(zig_step);
     rust_step.dependOn(&cargo_cmd.step);
 
     // --- Step 3: List supported targets ---

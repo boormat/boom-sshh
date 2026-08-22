@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # End-to-end test: start agent, send messages via Zig client, verify history.
 #
-# Usage: bash boom-sshsend_test.sh
+# Usage: bash boom-sshend_test.sh
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_BIN="$SCRIPT_DIR/target/release/boom-sshh"
-HISTSEND_BIN="$SCRIPT_DIR/zig-out/x86_64-linux-gnu/boom-sshsend"
+HISTSEND_BIN="$SCRIPT_DIR/zig-out/x86_64-linux-musl/boom-sshend"
 HISTFILE=$(mktemp)
 SOCK=$(mktemp -u)
 AGENT_PID=""
@@ -36,7 +36,7 @@ if [ ! -x "$AGENT_BIN" ]; then
 fi
 
 if [ ! -x "$HISTSEND_BIN" ]; then
-    echo "SKIP: boom-sshsend binary not found at $HISTSEND_BIN"
+    echo "SKIP: boom-sshend binary not found at $HISTSEND_BIN"
     exit 0
 fi
 

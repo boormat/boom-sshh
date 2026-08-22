@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="boormat/ssh-agent-history"
+REPO="boormat/boom-sshh"
 
 # --- Detect OS ---
 OS=$(uname -s)
@@ -58,6 +58,14 @@ install -m 0755 "${TMP}/${BIN}" "${INSTALL_DIR}/boom-sshh"
 
 echo ""
 echo "installed ${INSTALL_DIR}/boom-sshh"
+
+# --- Install boom-sshend client (extracted from the agent) ---
+CLIENT_ARCH="${ARCH_NAME}-${OS_NAME}"
+if "${INSTALL_DIR}/boom-sshh" --extract-client "${CLIENT_ARCH}" "${INSTALL_DIR}/boom-sshend" 2>/dev/null; then
+  echo "installed ${INSTALL_DIR}/boom-sshend"
+else
+  echo "warning: could not extract boom-sshend client (not embedded in this build)"
+fi
 echo ""
 echo "next steps:"
 echo "  eval \$(boom-sshh --init-agent)"

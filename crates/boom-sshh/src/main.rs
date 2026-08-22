@@ -12,15 +12,15 @@ use ssh_agent_lib::agent::listen;
 use crate::agent::HistoryAgent;
 
 // Embedded client binaries (built by build.rs from zig-out/)
-// Each is a prebuilt boom-sshsend binary for a specific architecture
+// Each is a prebuilt boom-sshend binary for a specific architecture
 const CLIENT_X86_64_LINUX: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-x86_64-linux"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshend-x86_64-linux"));
 const CLIENT_AARCH64_LINUX: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-aarch64-linux"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshend-aarch64-linux"));
 const CLIENT_X86_64_MACOS: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-x86_64-macos"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshend-x86_64-macos"));
 const CLIENT_AARCH64_MACOS: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshsend-aarch64-macos"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/boom-sshend-aarch64-macos"));
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -80,7 +80,7 @@ fn print_help() {
     println!("  boom-sshh --extract-client <arch> <path>      Extract client binary");
     println!("  boom-sshh --askpass                            Prompt for an approval request");
     println!();
-    println!("--init detects remote shell (bash/zsh/fish), installs boom-sshsend,");
+    println!("--init detects remote shell (bash/zsh/fish), installs boom-sshend,");
     println!("and injects the appropriate trap into shell config files.");
     println!();
     println!("--init-agent sets up the local machine: launches agent via keychain");

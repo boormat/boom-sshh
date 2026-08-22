@@ -26,3 +26,7 @@ sha2 = "0.10"
 # Approval prompting (askpass) + JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Approval UI: terminal panel (tty) + raw-mode terminal handling
+ratatui = { version = "0.29", default-features = false, features = ["termion"] }
+termion = "4"

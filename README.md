@@ -4,57 +4,27 @@ An SSH agent that logs command history from remote hosts via the SSH agent proto
 
 The agent runs locally and accepts standard SSH agent requests (key storage, signing) plus a custom `HISTORY` extension. Remote hosts send each command over the forwarded `SSH_AUTH_SOCK` using a small client binary.
 
-## How it works
-
-```
-┌──────────┐   SSH agent protocol    ┌──────────────┐
-│ remote   │ ─────────────────────── │  boom-sshh   │
-│ bash     │   HISTORY extension     │              │
-│ (trap)   │   over forwarded sock   │ (Rust, local)│
-└──────────┘                         └──────┬───────┘
-                                            │
-                                     writes to
-                                            ▼
-                                     ~/.history_all
-```
-
-Each history entry is written with a timestamp, hostname, uid, pid, and command:
-
-```
-#1700000000 myhost 1000 1234   42  ls -la /etc/hosts
-```
-
-## Install
-
-With [mise](https://mise.jdx.dev):
-
-```bash
-git clone https://github.com/boormat/ssh-agent-history.git
-cd ssh-agent-history
-mise install
-zig build
-```
-
-Or with Rust + Zig already installed:
-
-```bash
-zig build
-```
-
-This builds the Zig client (`boom-sshsend`) for all platforms and the Rust agent with embedded clients.
-
 ## Quick start
+
+Install the agent binary with the one-line installer, which downloads `install.sh`
+from the latest release and runs it:
+
+```bash
+curl -fsSL https://github.com/boormat/boom-sshh/releases/latest/download/install.sh | sh
+```
+
+Then start the agent and set up a remote host:
 
 1. Run the agent locally:
 
 ```bash
-eval $(./target/release/boom-sshh)
+eval $(boom-sshh)
 ```
 
 2. Set up a remote host:
 
 ```bash
-./target/release/boom-sshh --init user@remote-host
+boom-sshh --init user@remote-host
 ```
 
 3. SSH to the remote with agent forwarding:
@@ -64,6 +34,26 @@ ssh -A user@remote-host
 ```
 
 4. Commands are now logged to `~/.history_all` on your local machine.
+
+## How it works
+
+```
+┌──────────┐   SSH agent protocol    ┌──────────────┐
+│ remote   │ ─────────────────────── │  boom-sshh   │
+│ bash     │   HISTORY extension     │              │
+│ (trap)   │   over forwarded sock   │ (Rust, local)│
+└──────────┘                         └──────┬───────┘
+                                             │
+                                      writes to
+                                             ▼
+                                      ~/.history_all
+```
+
+Each history entry is written with a timestamp, hostname, uid, pid, and command:
+
+```
+#1700000000 myhost 1000 1234   42  ls -la /etc/hosts
+```
 
 ## Commands
 
@@ -81,7 +71,7 @@ ssh -A user@remote-host
 
 ## `--init` (remote)
 
-Detects remote shell (bash/zsh/fish), installs `boom-sshsend`, and injects the trap into shell config files.
+Detects remote shell (bash/zsh/fish), installs `boom-sshend`, and injects the trap into shell config files.
 
 ```bash
 boom-sshh --init user@remote-host
@@ -102,8 +92,9 @@ boom-sshh --init-agent --dry-run
 ```
 
 Pre-flight checks before modifying rc files:
-- Bails if keychain is already managing an agent
-- Bails if ssh-agent is running
+- Warns (non-fatal) if keychain is already managing an agent
+- Warns (non-fatal) if ssh-agent is running
+- Warns (non-fatal) if other agent-startup lines are found in the rc file
 - Skips agent launch if boom-sshh is already running
 - Skips if already configured
 
@@ -112,6 +103,8 @@ Pre-flight checks before modifying rc files:
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
+| `BOOM_SSHH_ASKPASS` | `boom-sshh --askpass` | Approver program for session-bind / destination-constraint / sign prompts. Default `boom-sshh --askpass` auto-selects a terminal panel (when a controlling tty exists) or a native GUI dialog (`zenity` → `kdialog` → `osascript`); set to `true` to always allow. |
+| `BOOM_SSHH_ASKPASS_TIMEOUT` | `60` | Approver timeout in seconds. |
 
 ```bash
 AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh)
@@ -119,53 +112,54 @@ AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh)
 
 ## Manual setup
 
-If you prefer not to use `--init`, install `boom-sshsend` on the remote host and add to the appropriate shell config:
+If you prefer not to use `--init`, install `boom-sshend` on the remote host and add to the appropriate shell config:
 
 ### Bash (`~/.bashrc`)
 
 ```bash
-__ha_history_trap() {
+__boomssh_trap() {
     local _line
     _line=$(history 1)
-    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
+    [[ -n "$_line" ]] && boom-sshend "$HOSTNAME" "$UID" "$$" "$_line"
 }
-trap __ha_history_trap DEBUG
+trap __boomssh_trap DEBUG
 ```
 
 ### Zsh (`~/.zshrc`)
 
 ```zsh
-__ha_history_trap() {
+__boomssh_trap() {
     local _line
     _line=$(fc -l -1)
-    [[ -n "$_line" ]] && boom-sshsend "$HOSTNAME" "$UID" "$$" "$_line"
+    [[ -n "$_line" ]] && boom-sshend "$HOSTNAME" "$UID" "$$" "$_line"
 }
-TRAPDEBUG=__ha_history_trap
+TRAPDEBUG=__boomssh_trap
 ```
 
 ### Fish (`~/.config/fish/conf.d/boom-sshh.fish`)
 
 ```fish
-function __ha_history_preexec --on-event fish_preexec
+function __boomssh_preexec --on-event fish_preexec
     if test -n "$argv[1]"
-        boom-sshsend $HOSTNAME $UID %self "$argv[1]"
+        boom-sshend $HOSTNAME $UID %self "$argv[1]"
     end
 end
 ```
 
-## Testing locally
+## Build and Testing
+
+For development, install the toolchain via [mise](https://mise.jdx.dev)
+(defined in `mise.toml`), then build:
 
 ```bash
-export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
-./target/release/boom-sshh &
+mise install
+zig build
 ```
 
-## Building
+This builds the Zig client (`boom-sshend`) for all platforms and the Rust agent
+with embedded clients. Additional targets:
 
 ```bash
-# Build everything (Zig client + Rust agent)
-zig build
-
 # Build just the Zig client
 zig build zig
 
@@ -176,14 +170,22 @@ cargo build --release
 cargo test
 ```
 
+### Testing locally
+
+```bash
+export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
+./target/release/boom-sshh &
+```
+
 ## Project structure
 
 ```
 build.zig                      — build orchestrator
-src/zig_tool/main.zig          — Zig client (boom-sshsend)
+src/zig_tool/main.zig          — Zig client (boom-sshend)
 crates/boom-sshh/
   src/main.rs                  — agent entry point
   src/agent.rs                 — Session impl with keyring + history
+  src/approval.rs              — askpass approval prompting
   src/init.rs                  — remote + local init logic
   build.rs                     — embeds prebuilt clients
 ```

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SSH integration test: starts sshd on a non-standard port, uses real SSH
-# agent forwarding, sends boom-sshsend from the remote side, verifies history.
+# agent forwarding, sends boom-sshend from the remote side, verifies history.
 #
 # Usage: bash ssh_test.sh
 #
@@ -11,7 +11,7 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_BIN="$SCRIPT_DIR/target/release/boom-sshh"
-HISTSEND_BIN="$SCRIPT_DIR/zig-out/x86_64-linux-gnu/boom-sshsend"
+HISTSEND_BIN="$SCRIPT_DIR/zig-out/x86_64-linux-musl/boom-sshend"
 PORT=2222
 
 # ── check prerequisites ─────────────────────────────────────────
@@ -118,7 +118,7 @@ ssh -p "$PORT" \
     -o LogLevel=ERROR \
     -A \
     127.0.0.1 \
-    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshsend testhost 1000 1234 '  42  ls -la'"
+    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshend testhost 1000 1234 '  42  ls -la'"
 sleep 0.3
 
 grep -qF "#1" "$HISTFILE"                              && ok "timestamp"    || fail "timestamp"
@@ -133,7 +133,7 @@ ssh -p "$PORT" \
     -o LogLevel=ERROR \
     -A \
     127.0.0.1 \
-    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshsend remote-host 500 999 '  1  pwd'"
+    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshend remote-host 500 999 '  1  pwd'"
 sleep 0.3
 
 ssh -p "$PORT" \
@@ -143,7 +143,7 @@ ssh -p "$PORT" \
     -o LogLevel=ERROR \
     -A \
     127.0.0.1 \
-    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshsend remote-host 500 999 '  2  whoami'"
+    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshend remote-host 500 999 '  2  whoami'"
 sleep 0.3
 
 LINES=$(wc -l < "$HISTFILE")
@@ -158,7 +158,7 @@ ssh -p "$PORT" \
     -o LogLevel=ERROR \
     -A \
     127.0.0.1 \
-    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshsend sp 1000 2222 '  3  echo \"hello world\" && ls ~/\"my dir\"'"
+    "PATH=$(dirname "$HISTSEND_BIN"):\$PATH boom-sshend sp 1000 2222 '  3  echo \"hello world\" && ls ~/\"my dir\"'"
 sleep 0.3
 
 grep -qF "echo \"hello world\"" "$HISTFILE" && ok "special chars" || fail "special chars"
