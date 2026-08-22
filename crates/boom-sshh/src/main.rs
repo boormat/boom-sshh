@@ -1,4 +1,5 @@
 mod agent;
+mod approval;
 mod init;
 
 use std::fs::{self, OpenOptions};
@@ -44,6 +45,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
             init::run_init_agent(dry_run)
         }
+        Some("--askpass") => match approval::run_askpass() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("boom-sshh --askpass: {e}");
+                std::process::exit(1);
+            }
+        },
         Some(other) => {
             eprintln!("error: unknown argument '{other}'");
             eprintln!();
@@ -70,6 +78,7 @@ fn print_help() {
     println!("  boom-sshh --version                           Show version");
     println!("  boom-sshh --list-clients                      List embedded clients");
     println!("  boom-sshh --extract-client <arch> <path>      Extract client binary");
+    println!("  boom-sshh --askpass                            Prompt for an approval request");
     println!();
     println!("--init detects remote shell (bash/zsh/fish), installs boom-sshsend,");
     println!("and injects the appropriate trap into shell config files.");
@@ -82,6 +91,9 @@ fn print_help() {
     println!("  SSH_AGENT_PID          Agent PID (set automatically)");
     println!("  AGENT_HISTFILE         History file path (default: ~/.history_all)");
     println!("  TEST_SSH_AUTH_SOCK     Override socket path (for testing)");
+    println!("  BOOM_SSHH_ASKPASS      Approver program (default: 'boom-sshh --askpass').");
+    println!("                          Set to 'true' to always allow (no prompt).");
+    println!("  BOOM_SSHH_ASKPASS_TIMEOUT  Approver timeout in seconds (default: 60).");
     println!();
     println!("Examples:");
     println!("  eval $(boom-sshh)");
@@ -184,6 +196,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
 
     let agent = HistoryAgent::new(histfile);
+    let listener_agent = agent::ListeningAgent::new(agent);
 
     // Output ssh-agent compatible env vars
     println!("SSH_AUTH_SOCK={socket_path}; export SSH_AUTH_SOCK;");
@@ -194,7 +207,7 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::remove_file(&socket_path);
 
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
-    listen(listener, agent).await?;
+    listen(listener, listener_agent).await?;
 
     Ok(())
 }

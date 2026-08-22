@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", features = ["crypto"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time"] }
 async-trait = "0.1"
 env_logger = "0.11"
 log = "0.4"
@@ -22,3 +22,7 @@ rsa = "0.9"
 rand = "0.8"
 sha1 = "0.10"
 sha2 = "0.10"
+
+# Approval prompting (askpass) + JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
