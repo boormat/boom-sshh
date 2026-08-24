@@ -84,7 +84,7 @@ PERMS=$(stat -c '%a' "$HISTFILE")
 echo ""
 echo "=== Test 5: log format ==="
 FIRST=$(head -1 "$HISTFILE")
-echo "$FIRST" | grep -qP '^#\d+ \S+ \d+ \d+ ' && ok "format: #ts host uid pid ..." || fail "format" "got: $FIRST"
+echo "$FIRST" | grep -qP '^#\d+ \S+ \S+ \d+ ' && ok "format: #ts host user pid ..." || fail "format" "got: $FIRST"
 
 echo ""
 echo "=== Test 6: no args shows usage ==="
