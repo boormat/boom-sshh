@@ -71,10 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
             init::run_init_agent(dry_run)
         }
-        Some("agent") => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_agent())
-        }
+        Some("agent") => run_agent_daemon(),
         Some("askpass") => match approval::run_askpass() {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -268,7 +265,8 @@ fn list_clients() {
     }
 }
 
-async fn run_agent() -> Result<(), Box<dyn std::error::Error>> {
+/// Daemonize the agent: fork, parent exits, child runs the listener.
+fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let pid = std::process::id();
@@ -294,22 +292,51 @@ async fn run_agent() -> Result<(), Box<dyn std::error::Error>> {
         .append(true)
         .open(&hist_path)?;
 
+    // Remove old socket if exists
+    let _ = fs::remove_file(&socket_path);
+
+    // Bind socket synchronously before fork
+    let std_listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+
     // Set socket permissions
     let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+
+    // Fork — parent prints env vars and exits, child daemonizes
+    let child_pid = unsafe { libc::fork() };
+    if child_pid > 0 {
+        // Parent: print env vars and exit
+        println!("SSH_AUTH_SOCK={socket_path}; export SSH_AUTH_SOCK;");
+        println!("SSH_AGENT_PID={child_pid}; export SSH_AGENT_PID;");
+        println!("echo Agent pid {child_pid};");
+        std::process::exit(0);
+    }
+
+    // Child: detach from terminal
+    unsafe {
+        libc::setsid();
+        libc::close(libc::STDIN_FILENO);
+        libc::close(libc::STDOUT_FILENO);
+        libc::close(libc::STDERR_FILENO);
+    }
+
+    // Create fresh tokio runtime in child
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_agent_listener(std_listener, histfile))?;
+
+    Ok(())
+}
+
+async fn run_agent_listener(
+    std_listener: std::os::unix::net::UnixListener,
+    histfile: std::fs::File,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std_listener.set_nonblocking(true)?;
+    let tokio_listener = tokio::net::UnixListener::from_std(std_listener)?;
 
     let agent = HistoryAgent::new(histfile);
     let listener_agent = agent::ListeningAgent::new(agent);
 
-    // Output ssh-agent compatible env vars
-    println!("SSH_AUTH_SOCK={socket_path}; export SSH_AUTH_SOCK;");
-    println!("SSH_AGENT_PID={pid}; export SSH_AGENT_PID;");
-    println!("echo Agent pid {pid};");
-
-    // Remove old socket if exists
-    let _ = fs::remove_file(&socket_path);
-
-    let listener = tokio::net::UnixListener::bind(&socket_path)?;
-    listen(listener, listener_agent).await?;
+    listen(tokio_listener, listener_agent).await?;
 
     Ok(())
 }
