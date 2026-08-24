@@ -316,21 +316,23 @@ impl Session for HistoryAgent {
                 let contents = String::from_utf8(extension.details.into_bytes())
                     .map_err(|e| AgentError::other(e))?;
 
-                // Dedup: skip if same command from same process
-                if let Some((pid, _uid)) = self.peer {
+                // Dedup: use parent PID from payload (3rd field: "hostname uid pid command")
+                if let Some(parent_pid) = contents.split_whitespace().nth(2)
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
                     let mut last = self.last_commands.lock().unwrap();
                     let now = Instant::now();
 
                     // Evict entries older than 24h
                     last.retain(|_, v| now.duration_since(v.seen) < Duration::from_secs(86400));
 
-                    // Skip if same command from same PID
-                    if let Some(entry) = last.get(&pid) {
+                    // Skip if same command from same shell PID
+                    if let Some(entry) = last.get(&parent_pid) {
                         if entry.command == contents {
                             return Ok(None);
                         }
                     }
-                    last.insert(pid, LastCommand { command: contents.clone(), seen: now });
+                    last.insert(parent_pid, LastCommand { command: contents.clone(), seen: now });
                 }
 
                 let ts = now_secs();
