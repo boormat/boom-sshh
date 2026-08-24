@@ -17,4 +17,5 @@
 ## Notes
 - Client binary is `boom-sshend` (the per-command sender); agent binary is `boom-sshh`.
 - The Zig source for the client lives in `src/zig_tool/main.zig`; it is compiled for each target and embedded into the Rust agent by `crates/boom-sshh/build.rs`.
-- Approvals (session-bind / destination-constraint / sign) are delegated to `BOOM_SSHH_ASKPASS`. The default `boom-sshh --askpass` auto-selects a terminal panel when a controlling tty exists, otherwise a native GUI dialog (zenity/kdialog/osascript); both show Allow / Deny and a Details drill-down.
+- CLI uses subcommands: `boom-sshh agent`, `boom-sshh init`, `boom-sshh init-agent`, `boom-sshh test-approval`, `boom-sshh askpass`, etc. Running with no arguments prints an error.
+- Approvals (session-bind / destination-constraint / sign) are delegated to `BOOM_SSHH_ASKPASS`. The default `boom-sshh askpass` auto-selects a terminal panel when a controlling tty exists, otherwise a native GUI dialog (zenity/kdialog/osascript); both show Allow / Deny and a Details drill-down. Exit code 0 = allow, non-zero = deny.

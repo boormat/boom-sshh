@@ -16,6 +16,12 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     var pos: usize = 0;
     var first = true;
     while (args.next()) |arg| {
+        // Check for --version / -V (only on first arg)
+        if (first and (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V"))) {
+            std.debug.print("boom-sshend 0.2.0\n", .{});
+            return;
+        }
+
         if (!first) {
             payload[pos] = ' ';
             pos += 1;

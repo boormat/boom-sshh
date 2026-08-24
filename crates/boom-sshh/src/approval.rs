@@ -3,11 +3,11 @@
 //! The agent is a headless daemon, so approval prompts are delegated to an
 //! external program configured through `BOOM_SSHH_ASKPASS`:
 //!
-//! * unset / empty  -> default to re-invoking `boom-sshh --askpass`, which
+//! * unset / empty  -> default to re-invoking `boom-sshh askpass`, which
 //!   prompts on the controlling terminal (`/dev/tty`).
-//! * `true` (or `1`, `yes`) -> security-off workaround: always allow, never prompt.
 //! * `<program> [args...]` -> spawn that program; it reads a JSON
 //!   [`ApprovalRequest`] on stdin and must print `allow` or `deny` to stdout.
+//!   Exit 0 = allow, non-zero = deny (unless stdout explicitly says "deny").
 //!
 //! If the approver cannot be reached (spawn failure, timeout, non-zero exit)
 //! the request is denied (fail-closed). The timeout is `BOOM_SSHH_ASKPASS_TIMEOUT`
@@ -34,14 +34,6 @@ pub struct ApprovalRequest {
 ///
 /// Returns `true` to allow, `false` to deny.
 pub async fn request_approval(req: &ApprovalRequest) -> bool {
-    // Security-off workaround: explicit "true" always allows.
-    if let Ok(v) = std::env::var("BOOM_SSHH_ASKPASS") {
-        let t = v.trim();
-        if t == "true" || t == "1" || t.eq_ignore_ascii_case("yes") {
-            return true;
-        }
-    }
-
     let timeout = std::env::var("BOOM_SSHH_ASKPASS_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -59,7 +51,7 @@ pub async fn request_approval(req: &ApprovalRequest) -> bool {
         _ => match std::env::current_exe() {
             Ok(exe) => {
                 let mut c = Command::new(exe);
-                c.arg("--askpass");
+                c.arg("askpass");
                 c
             }
             Err(_) => return false,
@@ -101,13 +93,13 @@ pub async fn request_approval(req: &ApprovalRequest) -> bool {
         Ok(Ok(out)) if out.status.success() => {
             let line = String::from_utf8_lossy(&out.stdout);
             let first = line.split_whitespace().next().unwrap_or("");
-            matches!(first, "allow" | "yes" | "y" | "true")
+            !matches!(first, "deny" | "no" | "n" | "false")
         }
         _ => false,
     }
 }
 
-/// Entry point for `boom-sshh --askpass`.
+/// Entry point for `boom-sshh askpass`.
 ///
 /// Reads a JSON [`ApprovalRequest`] from stdin, then shows an interactive prompt:
 /// a terminal panel when a controlling terminal (`/dev/tty`) is available, or a
@@ -132,8 +124,127 @@ pub fn run_askpass() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run a test approval request through the askpass UI.
+///
+/// Used by `test-approval` and `init-agent` to verify the approval UI works.
+/// `force_ui` can be `Some("tui")` or `Some("gui")` to override auto-detection.
+pub fn run_approval_test(force_ui: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(ui) = force_ui {
+        std::env::set_var("BOOM_SSHH_FORCE_UI", ui);
+    }
+
+    let req = ApprovalRequest {
+        kind: "test".into(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        summary: vec![
+            "Test approval prompt".into(),
+            "boom-sshh verification".into(),
+        ],
+    };
+
+    let decision = if tty_usable() {
+        prompt_tui(&req)
+    } else {
+        prompt_gui(&req)
+    };
+
+    let mut out = std::io::stdout();
+    use std::io::Write;
+    writeln!(out, "{}", if decision { "allow" } else { "deny" })?;
+    Ok(())
+}
+
+/// Detect which GUI helper is available for setup dialogs.
+///
+/// Only checks for native GUI tools (zenity/kdialog/osascript), not the TUI.
+/// Used by init-agent which requires a GUI for confirmation dialogs.
+pub fn detect_gui_helper() -> Option<String> {
+    if command_present("zenity") {
+        return Some("zenity (GUI)".into());
+    }
+    if command_present("kdialog") {
+        return Some("kdialog (GUI)".into());
+    }
+    if command_present("osascript") {
+        return Some("osascript (GUI)".into());
+    }
+    None
+}
+
+/// Show a confirmation dialog asking the user whether to proceed with boom-sshh setup.
+///
+/// Uses the same zenity/kdialog/osascript flow as the approval UI.
+/// Returns `true` if the user allows, `false` if deny or timeout.
+pub fn confirm_setup_gui() -> bool {
+    let text = "\
+Set up boom-sshh?
+
+This will:
+• Install boom-sshend to ~/.local/bin/
+• Add agent startup to your shell config
+• Add history trap to your shell config
+
+[Allow] to proceed, [Deny] to cancel.";
+
+    if command_present("zenity") {
+        let out = std::process::Command::new("zenity")
+            .args([
+                "--question",
+                "--title",
+                "boom-sshh setup",
+                "--ok-label",
+                "Allow",
+                "--cancel-label",
+                "Deny",
+                "--text",
+                text,
+                "--timeout",
+                "60",
+            ])
+            .output();
+        return match out {
+            Ok(o) => o.status.success(),
+            Err(_) => false,
+        };
+    }
+    if command_present("kdialog") {
+        let out = std::process::Command::new("kdialog")
+            .args([
+                "--title",
+                "boom-sshh setup",
+                "--yesno",
+                text,
+                "60",
+            ])
+            .output();
+        return match out {
+            Ok(o) => o.status.success(),
+            Err(_) => false,
+        };
+    }
+    if command_present("osascript") {
+        let script = format!(
+            "display dialog \"boom-sshh setup\n\nThis will install boom-sshend, add agent startup, and add history trap to your shell config.\" buttons {{\"Deny\", \"Allow\"}} default button \"Allow\""
+        );
+        let out = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output();
+        return match out {
+            Ok(o) => o.status.success(),
+            Err(_) => false,
+        };
+    }
+    false
+}
+
 /// True when a usable controlling terminal exists (so a TUI panel can be drawn).
 fn tty_usable() -> bool {
+    if let Ok(v) = std::env::var("BOOM_SSHH_FORCE_UI") {
+        return v == "tui";
+    }
     match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
         Ok(tty) => termion::is_tty(&tty),
         Err(_) => false,
@@ -395,8 +506,8 @@ fn gui_approver_cmd(text: &str, timeout: u64) -> Option<(String, Vec<String>)> {
 
 /// True if `name` resolves on PATH.
 fn command_present(name: &str) -> bool {
-    std::process::Command::new("command")
-        .args(["-v", name])
+    std::process::Command::new("sh")
+        .args(["-c", &format!("command -v {name}")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

@@ -94,7 +94,7 @@ echo "sshd pid=$SSHD_PID port=$PORT"
 
 SOCK="$TMPDIR/agent.sock"
 HISTFILE="$TMPDIR/history"
-TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" 2>/dev/null &
+TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" agent 2>/dev/null &
 AGENT_PID=$!
 for i in $(seq 1 50); do [[ -S "$SOCK" ]] && break; sleep 0.05; done
 [[ -S "$SOCK" ]] || { echo "FAIL: agent socket never appeared"; exit 1; }

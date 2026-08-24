@@ -26,41 +26,106 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
-        Some("--help") | Some("-h") => {
+        Some("help") | Some("--help") | Some("-h") => {
             print_help();
             Ok(())
         }
-        Some("--version") | Some("-V") => {
+        Some("version") | Some("--version") | Some("-V") => {
             println!("boom-sshh {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("--extract-client") => extract_client(&args[2..]),
-        Some("--list-clients") => Ok(list_clients()),
-        Some("--init") => {
+        Some("extract-client") => extract_client(&args[2..]),
+        Some("list-clients") => Ok(list_clients()),
+        Some("init") => {
+            if args[2..].iter().any(|a| a == "--help" || a == "-h") {
+                print_init_help();
+                return Ok(());
+            }
+            // Reject unknown long flags (single-dash args are SSH flags, pass through)
+            for arg in &args[2..] {
+                if arg.starts_with("--") && arg != "--dry-run" {
+                    eprintln!("error: unknown flag '{arg}'");
+                    eprintln!();
+                    print_init_help();
+                    std::process::exit(1);
+                }
+            }
             let rest: Vec<String> = args[2..].iter().filter(|a| a.as_str() != "--dry-run" && a.as_str() != "-d").cloned().collect();
             let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
             init::run_init(&rest, dry_run)
         }
-        Some("--init-agent") => {
+        Some("init-agent") => {
+            if args[2..].iter().any(|a| a == "--help" || a == "-h") {
+                print_init_agent_help();
+                return Ok(());
+            }
+            // Reject unknown flags
+            for arg in &args[2..] {
+                if arg.starts_with('-') && arg != "--dry-run" && arg != "-d" {
+                    eprintln!("error: unknown flag '{arg}'");
+                    eprintln!();
+                    print_init_agent_help();
+                    std::process::exit(1);
+                }
+            }
             let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
             init::run_init_agent(dry_run)
         }
-        Some("--askpass") => match approval::run_askpass() {
+        Some("agent") => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_agent())
+        }
+        Some("askpass") => match approval::run_askpass() {
             Ok(()) => Ok(()),
             Err(e) => {
-                eprintln!("boom-sshh --askpass: {e}");
+                eprintln!("boom-sshh askpass: {e}");
                 std::process::exit(1);
             }
         },
+        Some("test-approval") => {
+            if args[2..].iter().any(|a| a == "--help" || a == "-h") {
+                println!("boom-sshh test-approval — test the approval UI");
+                println!();
+                println!("Usage:");
+                println!("  boom-sshh test-approval              Auto-detect (TUI or GUI)");
+                println!("  boom-sshh test-approval --force-tui  Force TUI panel");
+                println!("  boom-sshh test-approval --force-gui  Force GUI dialog");
+                return Ok(());
+            }
+            for arg in &args[2..] {
+                if arg.starts_with('-') && arg != "--force-tui" && arg != "--force-gui" {
+                    eprintln!("error: unknown flag '{arg}'");
+                    eprintln!();
+                    eprintln!("usage: boom-sshh test-approval [--force-tui | --force-gui]");
+                    std::process::exit(1);
+                }
+            }
+            let force_ui = if args[2..].iter().any(|a| a == "--force-tui") {
+                Some("tui")
+            } else if args[2..].iter().any(|a| a == "--force-gui") {
+                Some("gui")
+            } else {
+                None
+            };
+            match approval::run_approval_test(force_ui) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("boom-sshh test-approval: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(other) => {
-            eprintln!("error: unknown argument '{other}'");
+            eprintln!("error: unknown subcommand '{other}'");
             eprintln!();
             print_help();
             std::process::exit(1);
         }
         None => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_agent())
+            eprintln!("error: no subcommand provided");
+            eprintln!();
+            print_help();
+            std::process::exit(1);
         }
     }
 }
@@ -69,43 +134,80 @@ fn print_help() {
     println!("boom-sshh — SSH agent with HISTORY extension for logging remote commands");
     println!();
     println!("Usage:");
-    println!("  boom-sshh                                     Start the agent");
-    println!("  boom-sshh --init <host>                       Init remote host");
-    println!("  boom-sshh --init --dry-run <host>             Preview remote init");
-    println!("  boom-sshh --init-agent                        Init local machine");
-    println!("  boom-sshh --init-agent --dry-run              Preview local init");
-    println!("  boom-sshh --help                              Show this help");
-    println!("  boom-sshh --version                           Show version");
-    println!("  boom-sshh --list-clients                      List embedded clients");
-    println!("  boom-sshh --extract-client <arch> <path>      Extract client binary");
-    println!("  boom-sshh --askpass                            Prompt for an approval request");
+    println!("  boom-sshh agent                              Start the agent");
+    println!("  boom-sshh init <host>                        Init remote host");
+    println!("  boom-sshh init --dry-run <host>              Preview remote init");
+    println!("  boom-sshh init-agent                         Init local machine");
+    println!("  boom-sshh init-agent --dry-run               Preview local init");
+    println!("  boom-sshh test-approval                      Test approval UI");
+    println!("  boom-sshh test-approval --force-tui          Force TUI panel");
+    println!("  boom-sshh test-approval --force-gui          Force GUI dialog");
+    println!("  boom-sshh askpass                            Prompt for approval (stdin)");
+    println!("  boom-sshh list-clients                       List embedded clients");
+    println!("  boom-sshh extract-client <arch> <path>       Extract client binary");
+    println!("  boom-sshh help                               Show this help");
+    println!("  boom-sshh version                            Show version");
     println!();
-    println!("--init detects remote shell (bash/zsh/fish), installs boom-sshend,");
+    println!("init detects remote shell (bash/zsh/fish), installs boom-sshend,");
     println!("and injects the appropriate trap into shell config files.");
     println!();
-    println!("--init-agent sets up the local machine: launches agent via keychain");
+    println!("init-agent sets up the local machine: launches agent via startup guard");
     println!("and adds the history trap to your shell config.");
+    println!("It also tests the approval UI to verify it works.");
     println!();
     println!("Environment variables:");
     println!("  SSH_AUTH_SOCK          Agent socket path (set automatically)");
     println!("  SSH_AGENT_PID          Agent PID (set automatically)");
     println!("  AGENT_HISTFILE         History file path (default: ~/.history_all)");
     println!("  TEST_SSH_AUTH_SOCK     Override socket path (for testing)");
-    println!("  BOOM_SSHH_ASKPASS      Approver program (default: 'boom-sshh --askpass').");
-    println!("                          Set to 'true' to always allow (no prompt).");
+    println!("  BOOM_SSHH_ASKPASS      Approver program (default: 'boom-sshh askpass').");
+    println!("                          Executes the given command; exit 0 = allow.");
     println!("  BOOM_SSHH_ASKPASS_TIMEOUT  Approver timeout in seconds (default: 60).");
     println!();
     println!("Examples:");
-    println!("  eval $(boom-sshh)");
-    println!("  boom-sshh --init user@remote-host");
-    println!("  boom-sshh --init -p 2222 user@remote-host");
-    println!("  boom-sshh --init --dry-run user@remote-host");
-    println!("  boom-sshh --init-agent");
+    println!("  eval $(boom-sshh agent)");
+    println!("  boom-sshh init user@remote-host");
+    println!("  boom-sshh init -p 2222 user@remote-host");
+    println!("  boom-sshh init --dry-run user@remote-host");
+    println!("  boom-sshh init-agent");
+    println!("  boom-sshh test-approval --force-gui");
+}
+
+fn print_init_help() {
+    println!("boom-sshh init — init a remote host for command logging");
+    println!();
+    println!("Usage:");
+    println!("  boom-sshh init <host>                  Init remote host");
+    println!("  boom-sshh init --dry-run <host>        Preview remote init");
+    println!("  boom-sshh init -p <port> <host>        Init via custom SSH port");
+    println!();
+    println!("Detects remote shell (bash/zsh/fish), installs boom-sshend,");
+    println!("and injects the history trap into shell config files.");
+    println!();
+    println!("Any extra arguments are passed through to SSH (e.g. -p, -i, -l).");
+}
+
+fn print_init_agent_help() {
+    println!("boom-sshh init-agent — set up the local machine for command logging");
+    println!();
+    println!("Usage:");
+    println!("  boom-sshh init-agent                 Init local machine");
+    println!("  boom-sshh init-agent --dry-run       Preview local init");
+    println!();
+    println!("This command:");
+    println!("  1. Detects your shell and config file");
+    println!("  2. Requires a GUI helper (zenity/kdialog/osascript) for confirmation");
+    println!("  3. Asks for confirmation via GUI dialog");
+    println!("  4. Installs boom-sshend locally");
+    println!("  5. Adds agent startup and history trap to your shell config");
+    println!("  6. Tests the approval UI to verify it works");
+    println!();
+    println!("A GUI helper is required. Install zenity, kdialog, or osascript.");
 }
 
 fn extract_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 2 {
-        eprintln!("usage: boom-sshh --extract-client <arch> <path>");
+        eprintln!("usage: boom-sshh extract-client <arch> <path>");
         eprintln!();
         eprintln!("Available architectures:");
         list_clients();

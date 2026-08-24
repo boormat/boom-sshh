@@ -43,7 +43,7 @@ fi
 # ── start agent ──────────────────────────────────────────────────
 
 export SSH_AUTH_SOCK="$SOCK"
-TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" 2>/dev/null &
+TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" agent 2>/dev/null &
 AGENT_PID=$!
 for i in $(seq 1 50); do [[ -S "$SOCK" ]] && break; sleep 0.05; done
 [[ -S "$SOCK" ]] || { echo "FAIL: socket never appeared"; exit 1; }
@@ -91,9 +91,9 @@ echo "=== Test 6: no args shows usage ==="
 
 echo ""
 echo "=== Test 7: extract client ==="
-"$AGENT_BIN" --list-clients | grep -q "x86_64-linux" && ok "list-clients works" || fail "list-clients"
+"$AGENT_BIN" list-clients | grep -q "x86_64-linux" && ok "list-clients works" || fail "list-clients"
 TMPCLIENT=$(mktemp)
-"$AGENT_BIN" --extract-client x86_64-linux "$TMPCLIENT" 2>&1 | grep -q "extracted" && ok "extract-client works" || fail "extract-client"
+"$AGENT_BIN" extract-client x86_64-linux "$TMPCLIENT" 2>&1 | grep -q "extracted" && ok "extract-client works" || fail "extract-client"
 file "$TMPCLIENT" | grep -q "ELF" && ok "extracted binary is ELF" || fail "extracted binary format"
 rm -f "$TMPCLIENT"
 

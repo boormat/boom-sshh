@@ -18,13 +18,13 @@ Then start the agent and set up a remote host:
 1. Run the agent locally:
 
 ```bash
-eval $(boom-sshh)
+eval $(boom-sshh agent)
 ```
 
 2. Set up a remote host:
 
 ```bash
-boom-sshh --init user@remote-host
+boom-sshh init user@remote-host
 ```
 
 3. SSH to the remote with agent forwarding:
@@ -59,60 +59,77 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 
 | Command | Description |
 |---|---|
-| `boom-sshh` | Start the agent |
-| `boom-sshh --init <host>` | Init remote host |
-| `boom-sshh --init --dry-run <host>` | Preview remote init |
-| `boom-sshh --init-agent` | Init local machine |
-| `boom-sshh --init-agent --dry-run` | Preview local init |
-| `boom-sshh --help` | Show help |
-| `boom-sshh --version` | Show version |
-| `boom-sshh --list-clients` | List embedded client architectures |
-| `boom-sshh --extract-client <arch> <path>` | Extract client binary |
+| `boom-sshh agent` | Start the agent |
+| `boom-sshh init <host>` | Init remote host |
+| `boom-sshh init --dry-run <host>` | Preview remote init |
+| `boom-sshh init-agent` | Init local machine |
+| `boom-sshh init-agent --dry-run` | Preview local init |
+| `boom-sshh test-approval` | Test approval UI |
+| `boom-sshh test-approval --force-tui` | Force TUI panel |
+| `boom-sshh test-approval --force-gui` | Force GUI dialog |
+| `boom-sshh askpass` | Prompt for approval (stdin) |
+| `boom-sshh list-clients` | List embedded client architectures |
+| `boom-sshh extract-client <arch> <path>` | Extract client binary |
+| `boom-sshh help` | Show help |
+| `boom-sshh version` | Show version |
+| `boom-sshend --version` | Show client version |
 
-## `--init` (remote)
+## `init` (remote)
 
 Detects remote shell (bash/zsh/fish), installs `boom-sshend`, and injects the trap into shell config files.
 
 ```bash
-boom-sshh --init user@remote-host
-boom-sshh --init -p 2222 user@remote-host
-boom-sshh --init --dry-run user@remote-host
+boom-sshh init user@remote-host
+boom-sshh init -p 2222 user@remote-host
+boom-sshh init --dry-run user@remote-host
 ```
 
-## `--init-agent` (local)
+## `init-agent` (local)
 
 Sets up the local machine:
-- Launches the agent via keychain on login
+- Launches the agent via a startup guard in your shell config
 - Adds the history trap to your shell config
-- Checks for existing agent/keychain and warns if detected
+- Detects the available approval UI (TUI panel, zenity, kdialog, or osascript)
+- Tests the approval UI to verify it works
+- Checks for existing agent and warns if detected
 
 ```bash
-boom-sshh --init-agent
-boom-sshh --init-agent --dry-run
+boom-sshh init-agent
+boom-sshh init-agent --dry-run
 ```
 
 Pre-flight checks before modifying rc files:
-- Warns (non-fatal) if keychain is already managing an agent
+- Warns (non-fatal) if other agent-startup lines are found in the rc file
 - Warns (non-fatal) if ssh-agent is running
 - Warns (non-fatal) if other agent-startup lines are found in the rc file
 - Skips agent launch if boom-sshh is already running
 - Skips if already configured
+
+## `test-approval`
+
+Tests the approval UI without setting up the full agent. Useful for verifying that the TUI panel or GUI dialog works on your system.
+
+```bash
+boom-sshh test-approval              # auto-detect (TUI or GUI)
+boom-sshh test-approval --force-tui  # force TUI panel on /dev/tty
+boom-sshh test-approval --force-gui  # force GUI dialog (zenity/kdialog)
+```
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
-| `BOOM_SSHH_ASKPASS` | `boom-sshh --askpass` | Approver program for session-bind / destination-constraint / sign prompts. Default `boom-sshh --askpass` auto-selects a terminal panel (when a controlling tty exists) or a native GUI dialog (`zenity` → `kdialog` → `osascript`); set to `true` to always allow. |
+| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for session-bind / destination-constraint / sign prompts. Executes the given command; exit 0 = allow, non-zero = deny. |
 | `BOOM_SSHH_ASKPASS_TIMEOUT` | `60` | Approver timeout in seconds. |
 
 ```bash
-AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh)
+AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh agent)
 ```
 
 ## Manual setup
 
-If you prefer not to use `--init`, install `boom-sshend` on the remote host and add to the appropriate shell config:
+If you prefer not to use `init`, install `boom-sshend` on the remote host and add to the appropriate shell config:
 
 ### Bash (`~/.bashrc`)
 
@@ -174,7 +191,7 @@ cargo test
 
 ```bash
 export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
-./target/release/boom-sshh &
+./target/release/boom-sshh agent &
 ```
 
 ## Project structure
