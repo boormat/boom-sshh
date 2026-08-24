@@ -12,12 +12,19 @@ struct RemoteInfo {
     fish_config: bool,
 }
 
-/// Build the shell snippet that sends each command via `boom-sshend`.
+/// Build the shell snippet that starts the agent and sends each command via `boom-sshend`.
 /// boom-sshend auto-detects hostname, uid, pid — trap only passes the command.
 /// Deduplication is handled by the agent (not the shell).
 fn build_trap_block(shell: &str) -> String {
     let mut block = String::new();
 
+    // Agent startup — reuse existing or start new (agent handles detection)
+    match shell {
+        "fish" => block.push_str("eval (boom-sshh agent)\n"),
+        _ => block.push_str("eval \"$(boom-sshh agent)\"\n"),
+    }
+
+    // Trap block — send commands to the agent
     match shell {
         "fish" => block.push_str(
             "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n",
@@ -28,54 +35,27 @@ fn build_trap_block(shell: &str) -> String {
     block
 }
 
-/// Remove all existing boom-ssh trap blocks, keychain eval lines, and agent startup guards.
-/// This ensures deduplication — only the new block will be present after cleanup.
+/// Remove all existing boom-ssh lines from config contents.
+/// Only needs to handle current format — no backwards compatibility.
 fn remove_existing_traps(contents: &str, shell: &str) -> String {
     let mut result = String::new();
-    let mut skip = false;
-    let mut skip_blank_after = false;
 
     for line in contents.lines() {
-        if skip {
-            // Inside a multi-line block — detect end
-            let at_end = line.contains("trap __boomssh_trap DEBUG")
-                || line.contains("TRAPDEBUG=__boomssh_trap")
-                || (shell == "fish" && line.trim() == "end");
-            // Detect end of agent startup guard (fi or end)
-            let at_guard_end = line.trim() == "fi" || (shell == "fish" && line.trim() == "end");
-            if at_end || at_guard_end {
-                skip = false;
-                skip_blank_after = true;
-                continue;
-            }
+        // Skip agent startup line
+        if line.contains("boom-sshh agent") && line.contains("eval") {
             continue;
         }
-
-        // Skip blank lines immediately after a removed block
-        if skip_blank_after && line.trim().is_empty() {
+        // Skip trap lines
+        if line.contains("boom-sshend") && (line.contains("trap") || line.contains("TRAPDEBUG")) {
             continue;
         }
-        skip_blank_after = false;
-
-        // Detect old multi-line trap patterns
-        if line.contains("__boomssh_trap()") || line.contains("function __boomssh_preexec") || line.contains("__boomssh_last=\"\"") {
-            skip = true;
+        // Skip fish function
+        if line.contains("function __boomssh_preexec") {
             continue;
         }
-
-        // Detect old agent startup guard
-        if line.contains("keychain") && line.contains("boom-sshh") {
-            skip = true;
+        // Skip fish end (only if it's the end of the preexec function)
+        if shell == "fish" && line.trim() == "end" && result.contains("__boomssh_preexec") {
             continue;
-        }
-        if line.contains("boom-sshh agent") && (line.contains("eval") || line.contains("test -S")) {
-            skip = true;
-            continue;
-        }
-
-        // Detect new single-line trap patterns
-        if line.contains("trap 'boom-sshend") || line.contains("TRAPDEBUG='boom-sshend") {
-            continue;  // skip this line (single-line trap, no block to skip)
         }
 
         result.push_str(line);
