@@ -4,6 +4,17 @@ const cfg = @import("targets.zig");
 pub fn build(b: *std.Build) void {
     const zig_out_base = b.pathFromRoot("zig-out");
 
+    // Read version from Cargo.toml (single source of truth)
+    const cargo_toml = @embedFile("crates/boom-sshh/Cargo.toml");
+    const version = comptime blk: {
+        // Find "version = "X.Y.Z"" in Cargo.toml
+        const marker = "version = \"";
+        const start = std.mem.indexOf(u8, cargo_toml, marker) orelse @panic("version not found in Cargo.toml");
+        const rest = cargo_toml[start + marker.len ..];
+        const end = std.mem.indexOf(u8, rest, "\"") orelse @panic("version not found in Cargo.toml");
+        break :blk rest[0..end];
+    };
+
     // --- Target option for agent build ---
     const resolved_target = b.standardTargetOptions(.{});
     const is_native = resolved_target.query.isNative();
@@ -17,12 +28,16 @@ pub fn build(b: *std.Build) void {
         const resolved = b.resolveTargetQuery(query);
         const triple = query.zigTriple(b.allocator) catch unreachable;
 
+        const options = b.addOptions();
+        options.addOption([]const u8, "version", version);
+
         const zig_mod = b.createModule(.{
             .root_source_file = b.path("src/zig_tool/main.zig"),
             .target = resolved,
             .optimize = .ReleaseSmall,
             .link_libc = true,
         });
+        zig_mod.addOptions("build_options", options);
 
         const exe = b.addExecutable(.{
             .name = "boom-sshend",

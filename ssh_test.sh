@@ -94,7 +94,7 @@ echo "sshd pid=$SSHD_PID port=$PORT"
 
 SOCK="$TMPDIR/agent.sock"
 HISTFILE="$TMPDIR/history"
-AGENT_OUTPUT=$(TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" agent 2>/dev/null)
+AGENT_OUTPUT=$(BOOM_SSHH_ASKPASS=true TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" agent 2>/dev/null)
 eval "$AGENT_OUTPUT"
 AGENT_PID=$SSH_AGENT_PID
 for i in $(seq 1 50); do [[ -S "$SOCK" ]] && break; sleep 0.05; done

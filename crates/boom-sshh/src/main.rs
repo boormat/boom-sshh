@@ -269,6 +269,21 @@ fn list_clients() {
 fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
+    // Check if agent is already running — just output env vars if so
+    if let (Ok(sock), Ok(pid_str)) = (
+        std::env::var("SSH_AUTH_SOCK"),
+        std::env::var("SSH_AGENT_PID"),
+    ) {
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            if std::path::Path::new(&sock).exists() && unsafe { libc::kill(pid as i32, 0) } == 0 {
+                println!("SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;");
+                println!("SSH_AGENT_PID={pid}; export SSH_AGENT_PID;");
+                println!("echo Agent pid {pid};");
+                return Ok(());
+            }
+        }
+    }
+
     let pid = std::process::id();
 
     // Determine socket path

@@ -472,7 +472,7 @@ fn zenity_approve(text: &str, timeout: u64, detail_path: &std::path::Path, has_d
                         ])
                         .arg(detail_path)
                         .status();
-                    continue;
+                    return true; // Details reviewed = proceed
                 }
                 return true;
             }

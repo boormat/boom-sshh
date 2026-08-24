@@ -13,45 +13,39 @@ struct RemoteInfo {
 }
 
 /// Build the shell snippet that sends each command via `boom-sshend`.
-/// `with_agent_startup` adds a guard that starts boom-sshh if not already running.
-fn build_trap_block(shell: &str, with_agent_startup: bool) -> String {
+/// boom-sshend auto-detects hostname, uid, pid — trap only passes the command.
+fn build_trap_block(shell: &str) -> String {
     let mut block = String::new();
 
-    // Agent startup guard — start boom-sshh if no valid agent is running
-    if with_agent_startup {
-        match shell {
-            "fish" => {
-                block.push_str("if not test -S \"$SSH_AUTH_SOCK\" 2>/dev/null\n");
-                block.push_str("    or not kill -0 $SSH_AGENT_PID 2>/dev/null\n");
-                block.push_str("    eval (boom-sshh agent)\n");
-                block.push_str("end\n");
-            }
-            "zsh" => {
-                block.push_str("if ! test -S \"${SSH_AUTH_SOCK:-/dev/null}\" 2>/dev/null || \\\n");
-                block.push_str("   ! kill -0 \"${SSH_AGENT_PID:-0}\" 2>/dev/null; then\n");
-                block.push_str("    eval \"$(boom-sshh agent)\"\n");
-                block.push_str("fi\n");
-            }
-            _ => {
-                block.push_str("if ! test -S \"${SSH_AUTH_SOCK:-/dev/null}\" 2>/dev/null || \\\n");
-                block.push_str("   ! kill -0 \"${SSH_AGENT_PID:-0}\" 2>/dev/null; then\n");
-                block.push_str("    eval \"$(boom-sshh agent)\"\n");
-                block.push_str("fi\n");
-            }
-        }
-    }
-
-    // Trap block — send commands to the agent
+    // Trap block — deduplicate and send commands to the agent
     match shell {
         "fish" => block.push_str(
-            "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend $HOSTNAME $UID %self \"$argv[1]\"\n    end\nend\n",
+            "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n",
         ),
-        "zsh" => block.push_str(
-            "__boomssh_trap() {\n    local _line\n    _line=$(fc -l -1)\n    [[ -n \"$_line\" ]] && boom-sshend \"$HOSTNAME\" \"$UID\" \"$$\" \"$_line\"\n}\nTRAPDEBUG=__boomssh_trap\n",
-        ),
-        _ => block.push_str(
-            "__boomssh_trap() {\n    local _line\n    _line=$(history 1)\n    [[ -n \"$_line\" ]] && boom-sshend \"$HOSTNAME\" \"$UID\" \"$$\" \"$_line\"\n}\ntrap __boomssh_trap DEBUG\n",
-        ),
+        "zsh" => {
+            block.push_str("__boomssh_last=\"\"\n");
+            block.push_str("__boomssh_trap() {\n");
+            block.push_str("    local _line\n");
+            block.push_str("    _line=$(fc -l -1)\n");
+            block.push_str("    if [[ -n \"$_line\" && \"$_line\" != \"$__boomssh_last\" ]]; then\n");
+            block.push_str("        __boomssh_last=\"$_line\"\n");
+            block.push_str("        boom-sshend \"$_line\"\n");
+            block.push_str("    fi\n");
+            block.push_str("}\n");
+            block.push_str("TRAPDEBUG=__boomssh_trap\n");
+        }
+        _ => {
+            block.push_str("__boomssh_last=\"\"\n");
+            block.push_str("__boomssh_trap() {\n");
+            block.push_str("    local _line\n");
+            block.push_str("    _line=$(history 1)\n");
+            block.push_str("    if [[ -n \"$_line\" && \"$_line\" != \"$__boomssh_last\" ]]; then\n");
+            block.push_str("        __boomssh_last=\"$_line\"\n");
+            block.push_str("        boom-sshend \"$_line\"\n");
+            block.push_str("    fi\n");
+            block.push_str("}\n");
+            block.push_str("trap __boomssh_trap DEBUG\n");
+        }
     }
     block
 }
@@ -64,8 +58,8 @@ fn remove_existing_traps(contents: &str, shell: &str) -> String {
     let mut skip_blank_after = false;
 
     for line in contents.lines() {
-        // Detect start of trap block
-        if !skip && (line.contains("__boomssh_trap()") || line.contains("function __boomssh_preexec")) {
+        // Detect start of trap block (includes __boomssh_last="" prefix)
+        if !skip && (line.contains("__boomssh_trap()") || line.contains("function __boomssh_preexec") || line.contains("__boomssh_last=\"\"")) {
             skip = true;
             continue;
         }
@@ -154,15 +148,15 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     // Determine which config files to inject into
     let mut configs: Vec<(&str, String)> = Vec::new();
     if info.bashrc {
-        configs.push(("~/.bashrc", build_trap_block("bash", false)));
+        configs.push(("~/.bashrc", build_trap_block("bash")));
     }
     if info.zshrc {
-        configs.push(("~/.zshrc", build_trap_block("zsh", false)));
+        configs.push(("~/.zshrc", build_trap_block("zsh")));
     }
     if info.fish_config {
         configs.push((
             "~/.config/fish/conf.d/boom-sshh.fish",
-            build_trap_block("fish", false),
+            build_trap_block("fish"),
         ));
     }
 
@@ -403,7 +397,7 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     install_agent_binary(&install_dir)?;
 
     // Build and inject the trap block
-    let block = build_trap_block(shell_name, true);
+    let block = build_trap_block(shell_name);
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -1,44 +1,73 @@
 const std = @import("std");
 const c = std.c;
+const build_options = @import("build_options");
+
+fn print_stdout(msg: []const u8) void {
+    _ = c.write(c.STDOUT_FILENO, msg.ptr, msg.len);
+}
 
 pub fn main(minimal: std.process.Init.Minimal) !void {
     // 1. Get SSH_AUTH_SOCK from environment
     const sock_path = minimal.environ.getPosix("SSH_AUTH_SOCK") orelse {
-        std.debug.print("SSH_AUTH_SOCK not set\n", .{});
+        print_stdout("SSH_AUTH_SOCK not set\n");
         return error.EnvNotFound;
     };
 
-    // 2. Collect args: boom-sshend <hostname> <uid> <pid> <command...>
+    // 2. Collect args
     var args = minimal.args.iterate();
     _ = args.next(); // skip argv[0]
 
-    var payload: [4096]u8 = undefined;
-    var pos: usize = 0;
-    var first = true;
+    // Count args and collect them
+    var arg_list: [64][]const u8 = undefined;
+    var arg_count: usize = 0;
     while (args.next()) |arg| {
-        // Check for --version / -V (only on first arg)
-        if (first and (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V"))) {
-            std.debug.print("boom-sshend 0.2.0\n", .{});
-            return;
+        if (arg_count < arg_list.len) {
+            arg_list[arg_count] = arg;
+            arg_count += 1;
         }
+    }
 
-        if (!first) {
+    if (arg_count == 0) {
+        print_stdout("usage: boom-sshend <command...>\n");
+        return error.MissingArgs;
+    }
+
+    // Check for version flags
+    if (arg_count == 1 and (std.mem.eql(u8, arg_list[0], "version") or std.mem.eql(u8, arg_list[0], "--version") or std.mem.eql(u8, arg_list[0], "-V"))) {
+        print_stdout("boom-sshend ");
+        print_stdout(build_options.version);
+        print_stdout("\n");
+        return;
+    }
+
+    // 3. Auto-detect hostname, uid, pid
+    var hostname_buf: [256]u8 = undefined;
+    const hostname_len = c.gethostname(&hostname_buf, hostname_buf.len);
+    const hostname: []const u8 = if (hostname_len == 0)
+        std.mem.sliceTo(&hostname_buf, 0)
+    else
+        "unknown";
+
+    const uid = c.getuid();
+    const ppid = c.getppid();
+
+    // 4. Build payload: hostname uid pid command
+    var payload: [4096]u8 = undefined;
+    const header = std.fmt.bufPrint(&payload, "{s} {} {} ", .{ hostname, uid, ppid }) catch return error.OutOfMemory;
+    var pos = header.len;
+
+    for (arg_list[0..arg_count]) |arg| {
+        if (pos > header.len) {
             payload[pos] = ' ';
             pos += 1;
         }
-        first = false;
         @memcpy(payload[pos..][0..arg.len], arg);
         pos += arg.len;
     }
 
-    if (pos == 0) {
-        std.debug.print("usage: boom-sshend <hostname> <uid> <pid> <command...>\n", .{});
-        return error.MissingArgs;
-    }
-
     const payload_slice = payload[0..pos];
 
-    // 3. Connect to Unix domain socket
+    // 4. Connect to Unix domain socket
     const fd = c.socket(c.AF.UNIX, c.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     defer _ = c.close(fd);
@@ -55,7 +84,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     const connect_result = c.connect(fd, @ptrCast(&addr), addr_len);
     if (connect_result != 0) return error.ConnectFailed;
 
-    // 4. Build SSH_AGENTC_EXTENSION_REQUEST message
+    // 5. Build SSH_AGENTC_EXTENSION_REQUEST message
     const ext_type = "HISTORY";
     const msg_len: u32 = @intCast(1 + 4 + ext_type.len + payload_slice.len);
 
@@ -80,7 +109,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     @memcpy(buf[p..][0..payload_slice.len], payload_slice);
     p += payload_slice.len;
 
-    // 5. Send
+    // 6. Send
     const written = c.write(fd, buf[0..p].ptr, p);
     if (written < 0) return error.WriteFailed;
 }
