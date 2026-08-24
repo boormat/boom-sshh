@@ -13,27 +13,27 @@ from the latest release and runs it:
 curl -fsSL https://github.com/boormat/boom-sshh/releases/latest/download/install.sh | sh
 ```
 
-Then start the agent and set up a remote host:
-
-1. Run the agent locally:
+Then set up your local machine:
 
 ```bash
-eval $(boom-sshh agent)
+boom-sshh init-agent
 ```
 
-2. Set up a remote host:
+This starts the agent, installs the client, and adds the history trap to your shell config.
+
+Set up a remote host:
 
 ```bash
 boom-sshh init user@remote-host
 ```
 
-3. SSH to the remote with agent forwarding:
+SSH to the remote with agent forwarding:
 
 ```bash
 ssh -A user@remote-host
 ```
 
-4. Commands are now logged to `~/.history_all` on your local machine.
+Commands are now logged to `~/.history_all` on your local machine.
 
 ## How it works
 
