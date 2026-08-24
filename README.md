@@ -72,7 +72,7 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 | `boom-sshh extract-client <arch> <path>` | Extract client binary |
 | `boom-sshh help` | Show help |
 | `boom-sshh version` | Show version |
-| `boom-sshend --version` | Show client version |
+| `boom-sshend version` | Show client version |
 
 ## `init` (remote)
 
@@ -87,10 +87,10 @@ boom-sshh init --dry-run user@remote-host
 ## `init-agent` (local)
 
 Sets up the local machine:
-- Launches the agent via a startup guard in your shell config
-- Adds the history trap to your shell config
-- Detects the available approval UI (TUI panel, zenity, kdialog, or osascript)
-- Tests the approval UI to verify it works
+- Installs boom-sshh agent and boom-sshend client
+- Starts agent and adds history trap to your shell config
+- Detects the available approval UI (zenity, kdialog, or osascript)
+- Confirms setup via GUI dialog before proceeding
 - Checks for existing agent and warns if detected
 
 ```bash
@@ -99,11 +99,9 @@ boom-sshh init-agent --dry-run
 ```
 
 Pre-flight checks before modifying rc files:
+- Warns (non-fatal) if ssh-agent is already running
 - Warns (non-fatal) if other agent-startup lines are found in the rc file
-- Warns (non-fatal) if ssh-agent is running
-- Warns (non-fatal) if other agent-startup lines are found in the rc file
-- Skips agent launch if boom-sshh is already running
-- Skips if already configured
+- Reuses existing agent if already running (no duplicate instances)
 
 ## `test-approval`
 
@@ -129,36 +127,30 @@ AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh agent)
 
 ## Manual setup
 
-If you prefer not to use `init`, install `boom-sshend` on the remote host and add to the appropriate shell config:
+If you prefer not to use `init`, install `boom-sshend` on the remote host and add to the appropriate shell config.
+boom-sshend auto-detects hostname, uid, pid — the trap only passes the command.
 
 ### Bash (`~/.bashrc`)
 
 ```bash
-__boomssh_trap() {
-    local _line
-    _line=$(history 1)
-    [[ -n "$_line" ]] && boom-sshend "$HOSTNAME" "$UID" "$$" "$_line"
-}
-trap __boomssh_trap DEBUG
+eval "$(boom-sshh agent)"
+trap 'boom-sshend "$(history 1)"' DEBUG
 ```
 
 ### Zsh (`~/.zshrc`)
 
 ```zsh
-__boomssh_trap() {
-    local _line
-    _line=$(fc -l -1)
-    [[ -n "$_line" ]] && boom-sshend "$HOSTNAME" "$UID" "$$" "$_line"
-}
-TRAPDEBUG=__boomssh_trap
+eval "$(boom-sshh agent)"
+TRAPDEBUG='boom-sshend "$(fc -l -1)"'
 ```
 
 ### Fish (`~/.config/fish/conf.d/boom-sshh.fish`)
 
 ```fish
+eval (boom-sshh agent)
 function __boomssh_preexec --on-event fish_preexec
     if test -n "$argv[1]"
-        boom-sshend $HOSTNAME $UID %self "$argv[1]"
+        boom-sshend "$argv[1]"
     end
 end
 ```
@@ -191,7 +183,7 @@ cargo test
 
 ```bash
 export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
-./target/release/boom-sshh agent &
+./target/release/boom-sshh agent
 ```
 
 ## Project structure

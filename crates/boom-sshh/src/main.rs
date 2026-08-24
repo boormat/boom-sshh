@@ -148,9 +148,8 @@ fn print_help() {
     println!("init detects remote shell (bash/zsh/fish), installs boom-sshend,");
     println!("and injects the appropriate trap into shell config files.");
     println!();
-    println!("init-agent sets up the local machine: launches agent via startup guard");
-    println!("and adds the history trap to your shell config.");
-    println!("It also tests the approval UI to verify it works.");
+    println!("init-agent sets up the local machine: installs agent + client,");
+    println!("starts agent, and adds the history trap to your shell config.");
     println!();
     println!("Environment variables:");
     println!("  SSH_AUTH_SOCK          Agent socket path (set automatically)");
