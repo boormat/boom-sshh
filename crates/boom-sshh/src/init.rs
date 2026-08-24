@@ -14,38 +14,16 @@ struct RemoteInfo {
 
 /// Build the shell snippet that sends each command via `boom-sshend`.
 /// boom-sshend auto-detects hostname, uid, pid — trap only passes the command.
+/// Deduplication is handled by the agent (not the shell).
 fn build_trap_block(shell: &str) -> String {
     let mut block = String::new();
 
-    // Trap block — deduplicate and send commands to the agent
     match shell {
         "fish" => block.push_str(
             "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n",
         ),
-        "zsh" => {
-            block.push_str("__boomssh_last=\"\"\n");
-            block.push_str("__boomssh_trap() {\n");
-            block.push_str("    local _line\n");
-            block.push_str("    _line=$(fc -l -1)\n");
-            block.push_str("    if [[ -n \"$_line\" && \"$_line\" != \"$__boomssh_last\" ]]; then\n");
-            block.push_str("        __boomssh_last=\"$_line\"\n");
-            block.push_str("        boom-sshend \"$_line\"\n");
-            block.push_str("    fi\n");
-            block.push_str("}\n");
-            block.push_str("TRAPDEBUG=__boomssh_trap\n");
-        }
-        _ => {
-            block.push_str("__boomssh_last=\"\"\n");
-            block.push_str("__boomssh_trap() {\n");
-            block.push_str("    local _line\n");
-            block.push_str("    _line=$(history 1)\n");
-            block.push_str("    if [[ -n \"$_line\" && \"$_line\" != \"$__boomssh_last\" ]]; then\n");
-            block.push_str("        __boomssh_last=\"$_line\"\n");
-            block.push_str("        boom-sshend \"$_line\"\n");
-            block.push_str("    fi\n");
-            block.push_str("}\n");
-            block.push_str("trap __boomssh_trap DEBUG\n");
-        }
+        "zsh" => block.push_str("TRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n"),
+        _ => block.push_str("trap 'boom-sshend \"$(history 1)\"' DEBUG\n"),
     }
     block
 }
@@ -58,24 +36,8 @@ fn remove_existing_traps(contents: &str, shell: &str) -> String {
     let mut skip_blank_after = false;
 
     for line in contents.lines() {
-        // Detect start of trap block (includes __boomssh_last="" prefix)
-        if !skip && (line.contains("__boomssh_trap()") || line.contains("function __boomssh_preexec") || line.contains("__boomssh_last=\"\"")) {
-            skip = true;
-            continue;
-        }
-
-        // Detect start of agent startup guard (old keychain or new direct startup)
-        if !skip && (line.contains("keychain") && line.contains("boom-sshh")) {
-            skip = true;
-            continue;
-        }
-        if !skip && line.contains("boom-sshh agent") && (line.contains("eval") || line.contains("test -S")) {
-            skip = true;
-            continue;
-        }
-
         if skip {
-            // Detect end of trap block
+            // Inside a multi-line block — detect end
             let at_end = line.contains("trap __boomssh_trap DEBUG")
                 || line.contains("TRAPDEBUG=__boomssh_trap")
                 || (shell == "fish" && line.trim() == "end");
@@ -94,6 +56,27 @@ fn remove_existing_traps(contents: &str, shell: &str) -> String {
             continue;
         }
         skip_blank_after = false;
+
+        // Detect old multi-line trap patterns
+        if line.contains("__boomssh_trap()") || line.contains("function __boomssh_preexec") || line.contains("__boomssh_last=\"\"") {
+            skip = true;
+            continue;
+        }
+
+        // Detect old agent startup guard
+        if line.contains("keychain") && line.contains("boom-sshh") {
+            skip = true;
+            continue;
+        }
+        if line.contains("boom-sshh agent") && (line.contains("eval") || line.contains("test -S")) {
+            skip = true;
+            continue;
+        }
+
+        // Detect new single-line trap patterns
+        if line.contains("trap 'boom-sshend") || line.contains("TRAPDEBUG='boom-sshend") {
+            continue;  // skip this line (single-line trap, no block to skip)
+        }
 
         result.push_str(line);
         result.push('\n');

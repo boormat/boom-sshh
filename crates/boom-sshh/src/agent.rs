@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use ssh_agent_lib::agent::{Agent, Session};
@@ -28,6 +29,12 @@ struct StoredKey {
 }
 
 #[derive(Clone)]
+struct LastCommand {
+    command: String,
+    seen: Instant,
+}
+
+#[derive(Clone)]
 #[allow(dead_code)]
 struct SessionBindingInfo {
     host_fp: String,
@@ -44,6 +51,8 @@ pub struct HistoryAgent {
     session_binding: Option<SessionBindingInfo>,
     /// PID/UID of the process on the other end of the agent socket.
     peer: Option<(u32, u32)>,
+    /// Last command per PID for dedup (24h eviction).
+    last_commands: Arc<Mutex<HashMap<u32, LastCommand>>>,
 }
 
 impl HistoryAgent {
@@ -53,6 +62,7 @@ impl HistoryAgent {
             histfile: Arc::new(Mutex::new(histfile)),
             session_binding: None,
             peer: None,
+            last_commands: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -305,6 +315,23 @@ impl Session for HistoryAgent {
             "HISTORY" => {
                 let contents = String::from_utf8(extension.details.into_bytes())
                     .map_err(|e| AgentError::other(e))?;
+
+                // Dedup: skip if same command from same process
+                if let Some((pid, _uid)) = self.peer {
+                    let mut last = self.last_commands.lock().unwrap();
+                    let now = Instant::now();
+
+                    // Evict entries older than 24h
+                    last.retain(|_, v| now.duration_since(v.seen) < Duration::from_secs(86400));
+
+                    // Skip if same command from same PID
+                    if let Some(entry) = last.get(&pid) {
+                        if entry.command == contents {
+                            return Ok(None);
+                        }
+                    }
+                    last.insert(pid, LastCommand { command: contents.clone(), seen: now });
+                }
 
                 let ts = now_secs();
                 let bind_suffix = match &self.session_binding {
