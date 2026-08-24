@@ -40,7 +40,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         return;
     }
 
-    // 3. Auto-detect hostname, uid, pid
+    // 3. Auto-detect hostname, username/uid, pid
     var hostname_buf: [256]u8 = undefined;
     const hostname_len = c.gethostname(&hostname_buf, hostname_buf.len);
     const hostname: []const u8 = if (hostname_len == 0)
@@ -48,12 +48,22 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     else
         "unknown";
 
+    // Get username, fall back to uid string if lookup fails
     const uid = c.getuid();
+    const pw = c.getpwuid(uid);
+    var uid_buf: [20]u8 = undefined;
+    const user: []const u8 = if (pw) |p| blk: {
+        if (p.name) |name| {
+            break :blk std.mem.sliceTo(name, 0);
+        }
+        break :blk std.fmt.bufPrint(&uid_buf, "{}", .{uid}) catch "unknown";
+    } else std.fmt.bufPrint(&uid_buf, "{}", .{uid}) catch "unknown";
+
     const ppid = c.getppid();
 
-    // 4. Build payload: hostname uid pid command
+    // 4. Build payload: hostname user pid command
     var payload: [4096]u8 = undefined;
-    const header = std.fmt.bufPrint(&payload, "{s} {} {} ", .{ hostname, uid, ppid }) catch return error.OutOfMemory;
+    const header = std.fmt.bufPrint(&payload, "{s} {s} {} ", .{ hostname, user, ppid }) catch return error.OutOfMemory;
     var pos = header.len;
 
     for (arg_list[0..arg_count]) |arg| {

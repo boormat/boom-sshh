@@ -6,31 +6,20 @@ The agent runs locally and accepts standard SSH agent requests (key storage, sig
 
 ## Quick start
 
-Install the agent binary with the one-line installer, which downloads `install.sh`
-from the latest release and runs it:
+This starts installs the agent, and has it started in bashrc or equivalent. It is configured to log history via the agent.
 
 ```bash
 curl -fsSL https://github.com/boormat/boom-sshh/releases/latest/download/install.sh | sh
-```
-
-Then set up your local machine:
-
-```bash
 boom-sshh init-agent
+
+source ~/.bashrc
+
 ```
 
-This starts the agent, installs the client, and adds the history trap to your shell config.
-
-Set up a remote host:
+Set up a remote hosts environment. It installs the boom-sshend binary and configures to send history back to ssh-agent.
 
 ```bash
 boom-sshh init user@remote-host
-```
-
-SSH to the remote with agent forwarding:
-
-```bash
-ssh -A user@remote-host
 ```
 
 Commands are now logged to `~/.history_all` on your local machine.
