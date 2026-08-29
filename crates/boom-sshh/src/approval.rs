@@ -32,8 +32,13 @@ pub struct ApprovalRequest {
 
 /// Ask the configured approver whether a request should be allowed.
 ///
-/// Returns `true` to allow, `false` to deny.
-pub async fn request_approval(req: &ApprovalRequest) -> bool {
+/// Returns `Some(true)` to allow, `Some(false)` to deny (an explicit decision
+/// from a reachable approver), or `None` when no approver could be reached
+/// (spawn failure, timeout, or no usable UI). Callers decide how to treat the
+/// unreachable case: signing fails open (so headless ssh stays passwordless),
+/// while the sensitive session-bind / destination-constraint registrations fail
+/// closed.
+pub async fn request_approval(req: &ApprovalRequest) -> Option<bool> {
     let timeout = std::env::var("BOOM_SSHH_ASKPASS_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -54,13 +59,13 @@ pub async fn request_approval(req: &ApprovalRequest) -> bool {
                 c.arg("askpass");
                 c
             }
-            Err(_) => return false,
+            Err(_) => return None,
         },
     };
 
     let json = match serde_json::to_string(req) {
         Ok(j) => j,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     cmd.stdin(std::process::Stdio::piped())
@@ -69,16 +74,16 @@ pub async fn request_approval(req: &ApprovalRequest) -> bool {
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     {
         let mut stdin = match child.stdin.take() {
             Some(s) => s,
-            None => return false,
+            None => return None,
         };
         if stdin.write_all(json.as_bytes()).await.is_err() {
-            return false;
+            return None;
         }
         let _ = stdin.shutdown().await;
         drop(stdin);
@@ -93,9 +98,9 @@ pub async fn request_approval(req: &ApprovalRequest) -> bool {
         Ok(Ok(out)) if out.status.success() => {
             let line = String::from_utf8_lossy(&out.stdout);
             let first = line.split_whitespace().next().unwrap_or("");
-            !matches!(first, "deny" | "no" | "n" | "false")
+            Some(!matches!(first, "deny" | "no" | "n" | "false"))
         }
-        _ => false,
+        _ => None,
     }
 }
 

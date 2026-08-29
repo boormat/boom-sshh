@@ -91,8 +91,18 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     let host = filtered.last().ok_or("no host specified")?;
     let ssh_args = &filtered[..filtered.len() - 1];
 
+    // Per-host control socket for connection multiplexing. Reusing one master
+    // connection means a single authentication instead of one per ssh/scp call.
+    let mut control_path = std::env::temp_dir();
+    control_path.push(format!("boom-sshh-init-{}.sock", sanitize_host(host)));
+    let control_path = control_path.to_string_lossy().into_owned();
+
+    // Pre-flight: ensure an agent is reachable and holds a key, so ssh never
+    // needs to fall back to an interactive password prompt.
+    ensure_agent_ready()?;
+
     println!("detecting remote {host}...");
-    let info = detect_remote(&ssh_args, host)?;
+    let info = detect_remote(&ssh_args, host, &control_path)?;
 
     // Map arch to client name
     let client_arch = match info.arch.as_str() {
@@ -142,6 +152,7 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     if dry_run {
         println!();
         println!("(dry run — no changes made)");
+        close_mux(&control_path, ssh_args, host);
         return Ok(());
     }
 
@@ -175,46 +186,72 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
 
     // SCP to remote — convert -p PORT to -P PORT for scp
     let remote_path = format!("{host}:~/.local/bin/boom-sshend");
-    let mut scp_args: Vec<&str> = Vec::new();
+    let mut scp_args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
     let mut i = 0;
     while i < ssh_args.len() {
         if ssh_args[i] == "-p" && i + 1 < ssh_args.len() {
-            scp_args.push("-P");
-            scp_args.push(ssh_args[i + 1]);
+            scp_args.push("-P".to_string());
+            scp_args.push(ssh_args[i + 1].to_string());
             i += 2;
         } else {
-            scp_args.push(ssh_args[i]);
+            scp_args.push(ssh_args[i].to_string());
             i += 1;
         }
     }
-    scp_args.extend(["-O", "-q", client_path.to_str().unwrap()]);
-    scp_args.push(&remote_path);
+    scp_args.extend(mux_opts(&control_path));
+    scp_args.extend([
+        "-O".to_string(),
+        "-q".to_string(),
+        client_path.to_str().unwrap().to_string(),
+    ]);
+    scp_args.push(remote_path);
 
     // First ensure directory exists
-    let mut mkdir_args: Vec<&str> = Vec::new();
-    mkdir_args.extend(ssh_args.iter());
-    mkdir_args.extend(["-q", host, "--", "mkdir", "-p", "~/.local/bin"]);
+    let mut mkdir_args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
+    mkdir_args.extend(mux_opts(&control_path));
+    mkdir_args.extend([
+        "-q".to_string(),
+        host.to_string(),
+        "--".to_string(),
+        "mkdir".to_string(),
+        "-p".to_string(),
+        "~/.local/bin".to_string(),
+    ]);
 
     let status = Command::new("ssh").args(&mkdir_args).status()?;
     if !status.success() {
         eprintln!("error: failed to create ~/.local/bin on remote");
+        eprintln!("       (check that your key is loaded in the agent: ssh-add -l)");
+        close_mux(&control_path, ssh_args, host);
         std::process::exit(1);
     }
 
+    // scp supports the same -o passthrough as ssh
     let status = Command::new("scp").args(&scp_args).status()?;
     if !status.success() {
         eprintln!("error: failed to copy boom-sshend to remote");
+        eprintln!("       (check that your key is loaded in the agent: ssh-add -l)");
+        close_mux(&control_path, ssh_args, host);
         std::process::exit(1);
     }
 
     // Make executable
-    let mut chmod_args: Vec<&str> = Vec::new();
-    chmod_args.extend(ssh_args.iter());
-    chmod_args.extend(["-q", host, "--", "chmod", "+x", "~/.local/bin/boom-sshend"]);
+    let mut chmod_args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
+    chmod_args.extend(mux_opts(&control_path));
+    chmod_args.extend([
+        "-q".to_string(),
+        host.to_string(),
+        "--".to_string(),
+        "chmod".to_string(),
+        "+x".to_string(),
+        "~/.local/bin/boom-sshend".to_string(),
+    ]);
 
     let status = Command::new("ssh").args(&chmod_args).status()?;
     if !status.success() {
         eprintln!("error: failed to chmod boom-sshend on remote");
+        eprintln!("       (check that your key is loaded in the agent: ssh-add -l)");
+        close_mux(&control_path, ssh_args, host);
         std::process::exit(1);
     }
 
@@ -226,7 +263,7 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
 
         // Check if already configured
         let check_cmd = format!("grep -q '{CONFIG_SENTINEL}' {path} 2>/dev/null");
-        let already_configured = ssh_exec(ssh_args, host, &check_cmd).is_ok();
+        let already_configured = ssh_exec(ssh_args, host, &check_cmd, &control_path).is_ok();
 
         if already_configured {
             println!("  {path}: already configured — skipping");
@@ -237,13 +274,22 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
         let append_cmd = format!(
             "cat >> {path} << 'HISTEOF'\n{block}\nHISTEOF"
         );
-        let mut append_args: Vec<&str> = Vec::new();
-        append_args.extend(ssh_args.iter());
-        append_args.extend(["-t", host, "--", "bash", "-c", &append_cmd]);
+        let mut append_args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
+        append_args.extend(mux_opts(&control_path));
+        append_args.extend([
+            "-t".to_string(),
+            host.to_string(),
+            "--".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            append_cmd,
+        ]);
 
         let status = Command::new("ssh").args(&append_args).status()?;
         if !status.success() {
             eprintln!("error: failed to inject trap into {path}");
+            eprintln!("       (check that your key is loaded in the agent: ssh-add -l)");
+            close_mux(&control_path, ssh_args, host);
             std::process::exit(1);
         }
 
@@ -252,6 +298,7 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
 
     // Cleanup
     let _ = fs::remove_dir_all(&tmp_dir);
+    close_mux(&control_path, ssh_args, host);
 
     println!();
     println!("init complete! Restart your shell or run: source ~/.bashrc");
@@ -560,19 +607,20 @@ fn detect_local_shell() -> String {
 fn detect_remote(
     ssh_args: &[&str],
     host: &str,
+    control_path: &str,
 ) -> Result<RemoteInfo, Box<dyn std::error::Error>> {
-    let arch = ssh_exec(ssh_args, host, "uname -m")?;
+    let arch = ssh_exec(ssh_args, host, "uname -m", control_path)?;
     let arch = arch.trim().to_string();
 
-    let client_installed = ssh_exec(ssh_args, host, "which boom-sshend >/dev/null 2>&1")
+    let client_installed = ssh_exec(ssh_args, host, "which boom-sshend >/dev/null 2>&1", control_path)
         .map(|_| true)
         .unwrap_or(false);
 
-    let bashrc = ssh_exec(ssh_args, host, "test -f ~/.bashrc && echo yes || echo no")
+    let bashrc = ssh_exec(ssh_args, host, "test -f ~/.bashrc && echo yes || echo no", control_path)
         .map(|s| s.trim() == "yes")
         .unwrap_or(false);
 
-    let zshrc = ssh_exec(ssh_args, host, "test -f ~/.zshrc && echo yes || echo no")
+    let zshrc = ssh_exec(ssh_args, host, "test -f ~/.zshrc && echo yes || echo no", control_path)
         .map(|s| s.trim() == "yes")
         .unwrap_or(false);
 
@@ -580,6 +628,7 @@ fn detect_remote(
         ssh_args,
         host,
         "test -f ~/.config/fish/config.fish && echo yes || echo no",
+        control_path,
     )
     .map(|s| s.trim() == "yes")
     .unwrap_or(false);
@@ -597,10 +646,11 @@ fn ssh_exec(
     ssh_args: &[&str],
     host: &str,
     command: &str,
+    control_path: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut args: Vec<&str> = Vec::new();
-    args.extend(ssh_args);
-    args.extend(["-q", host, "--", command]);
+    let mut args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
+    args.extend(mux_opts(control_path));
+    args.extend(["-q".to_string(), host.to_string(), "--".to_string(), command.to_string()]);
 
     let output = Command::new("ssh").args(&args).output()?;
 
@@ -613,6 +663,66 @@ fn ssh_exec(
     }
 
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// SSH options that (a) reuse a single master connection for all the ssh/scp
+/// calls init makes and (b) forbid interactive auth so a missing-agent key
+/// fails loudly instead of prompting for a password.
+fn mux_opts(control_path: &str) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={control_path}"),
+        "-o".to_string(),
+        "ControlPersist=60".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+    ]
+}
+
+/// Close the multiplexed master connection so no control socket lingers.
+/// Failures are ignored — this is best-effort cleanup.
+fn close_mux(control_path: &str, ssh_args: &[&str], host: &str) {
+    let mut args: Vec<String> = Vec::new();
+    args.extend(ssh_args.iter().map(|s| s.to_string()));
+    args.extend([
+        "-o".to_string(),
+        format!("ControlPath={control_path}"),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-q".to_string(),
+        host.to_string(),
+        "-O".to_string(),
+        "exit".to_string(),
+    ]);
+    let _ = Command::new("ssh").args(&args).status();
+}
+
+/// Turn a host string into a filesystem-safe token for the control socket name.
+fn sanitize_host(host: &str) -> String {
+    host.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+/// Verify an SSH agent is reachable and holds at least one key, so that the
+/// subsequent ssh/scp calls can authenticate without an interactive prompt.
+fn ensure_agent_ready() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("SSH_AUTH_SOCK").is_err() {
+        eprintln!("error: no SSH agent found (SSH_AUTH_SOCK is not set)");
+        eprintln!("       start one with: eval $(boom-sshh agent)");
+        std::process::exit(1);
+    }
+
+    let out = Command::new("ssh-add").arg("-l").output()?;
+    if !out.status.success() {
+        eprintln!("error: no keys loaded in the SSH agent");
+        eprintln!("       add your key first: ssh-add ~/.ssh/id_rsa");
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 fn dirs_or_default() -> PathBuf {

@@ -155,26 +155,14 @@ impl Session for HistoryAgent {
             .unwrap_or_else(|| "?".to_string());
         let bound = self.session_binding.is_some();
 
-        if !bound {
-            let summary = vec![format!("key: {key_fp}"), format!("peer: {peer}")];
-            let req = ApprovalRequest {
-                kind: "sign".to_string(),
-                timestamp: now_secs(),
-                summary,
-            };
-            let allowed = request_approval(&req).await;
-            self.write_audit(&format!(
-                "SIGN key={key_fp} peer={peer} bound=0 decision={}",
-                if allowed { "allow" } else { "deny" }
-            ));
-            if !allowed {
-                return Err(AgentError::other(std::io::Error::other(
-                    "signing denied by approver",
-                )));
-            }
-        } else {
-            self.write_audit(&format!("SIGN key={key_fp} peer={peer} bound=1 decision=allow"));
-        }
+        // Sign like a standard ssh-agent: no per-signature approval prompt, so
+        // interactive ssh stays passwordless. The sensitive operations
+        // (session-bind and destination-constraint registration) remain gated
+        // by approval and fail closed when no approver is reachable.
+        self.write_audit(&format!(
+            "SIGN key={key_fp} peer={peer} bound={} decision=allow",
+            bound as u8
+        ));
 
         match identity.privkey.key_data() {
             KeypairData::Ed25519(key) => {
@@ -282,7 +270,7 @@ impl Session for HistoryAgent {
                 timestamp: now_secs(),
                 summary,
             };
-            let allowed = request_approval(&req).await;
+            let allowed = matches!(request_approval(&req).await, Some(true));
             self.write_audit(&format!(
                 "DEST-CONSTRAINT key={key_fp} constraints={} decision={}",
                 rd.constraints.len(),
@@ -370,7 +358,7 @@ impl Session for HistoryAgent {
                     timestamp: now_secs(),
                     summary,
                 };
-                let allowed = request_approval(&req).await;
+                let allowed = matches!(request_approval(&req).await, Some(true));
                 self.write_audit(&format!(
                     "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision={}",
                     bind.is_forwarding as u8,
