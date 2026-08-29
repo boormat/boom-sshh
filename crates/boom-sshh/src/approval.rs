@@ -28,21 +28,48 @@ pub struct ApprovalRequest {
     pub timestamp: u64,
     /// Human-readable facts shown to the user.
     pub summary: Vec<String>,
+    /// Fingerprint of the key being asked about.
+    pub key_fp: String,
+    /// Operation class: `git-commit`, `git-tag`, `ssh-userauth`, `unknown`.
+    pub op: String,
+    /// Human-readable hostname (when known), e.g. from a HISTORY line.
+    pub host_label: Option<String>,
+    /// Destination host key fingerprint (when bound), from session-bind.
+    pub host_fp: Option<String>,
+    /// Recent commands on this session (display context only).
+    pub recent: Vec<String>,
+}
+
+/// The outcome of an approval request.
+#[derive(Clone, Copy)]
+pub struct ApprovalDecision {
+    pub allow: bool,
+    /// How long an allow decision stays valid. `None` = until the agent exits
+    /// (session-scoped); `Some(d)` = expires after `d`.
+    pub ttl: Option<std::time::Duration>,
 }
 
 /// Ask the configured approver whether a request should be allowed.
 ///
-/// Returns `Some(true)` to allow, `Some(false)` to deny (an explicit decision
-/// from a reachable approver), or `None` when no approver could be reached
-/// (spawn failure, timeout, or no usable UI). Callers decide how to treat the
-/// unreachable case: signing fails open (so headless ssh stays passwordless),
-/// while the sensitive session-bind / destination-constraint registrations fail
-/// closed.
-pub async fn request_approval(req: &ApprovalRequest) -> Option<bool> {
+/// Returns `Some(decision)` for an explicit decision from a reachable approver,
+/// or `None` when no approver could be reached (spawn failure, timeout, or no
+/// usable UI). Callers fail closed on `None`.
+pub async fn request_approval(req: &ApprovalRequest) -> Option<ApprovalDecision> {
     let timeout = std::env::var("BOOM_SSHH_ASKPASS_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+    // `BOOM_SSHH_ASKPASS=true` is the documented "always allow" (security-off)
+    // shortcut — it spawns `true`, which prints nothing, so treat it specially.
+    if let Ok(p) = std::env::var("BOOM_SSHH_ASKPASS") {
+        if p.trim() == "true" {
+            return Some(ApprovalDecision {
+                allow: true,
+                ttl: None,
+            });
+        }
+    }
 
     let mut cmd = match std::env::var("BOOM_SSHH_ASKPASS") {
         Ok(p) if !p.trim().is_empty() => {
@@ -95,21 +122,59 @@ pub async fn request_approval(req: &ApprovalRequest) -> Option<bool> {
     )
     .await
     {
-        Ok(Ok(out)) if out.status.success() => {
-            let line = String::from_utf8_lossy(&out.stdout);
-            let first = line.split_whitespace().next().unwrap_or("");
-            Some(!matches!(first, "deny" | "no" | "n" | "false"))
-        }
+        Ok(Ok(out)) if out.status.success() => parse_approval_response(&out.stdout),
         _ => None,
     }
+}
+
+/// Parse an approver's stdout into a decision.
+///
+/// Accepted tokens (first whitespace-delimited word onward):
+/// `allow` / `allow session`              → allow, session-scoped
+/// `allow 5m` `allow 1h` `allow 12h`      → allow for the given duration
+/// `allow <n>s|m|h`                       → allow for N seconds/minutes/hours
+/// `deny` / `deny session` / `no` / `n` / `false` → deny
+pub fn parse_approval_response(stdout: &[u8]) -> Option<ApprovalDecision> {
+    let line = String::from_utf8_lossy(stdout);
+    let mut parts = line.split_whitespace();
+    let verb = parts.next().unwrap_or("");
+    match verb {
+        "allow" => {
+            let ttl = parse_duration(parts.next().unwrap_or("session"));
+            Some(ApprovalDecision { allow: true, ttl })
+        }
+        "deny" | "no" | "n" | "false" => Some(ApprovalDecision {
+            allow: false,
+            ttl: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Parse a duration token like `session`, `5m`, `1h`, `12h`, `3600s`.
+fn parse_duration(tok: &str) -> Option<std::time::Duration> {
+    if tok == "session" {
+        return None;
+    }
+    let (num, unit) = tok.split_at(tok.find(|c: char| !c.is_ascii_digit()).unwrap_or(tok.len()));
+    let n: u64 = num.parse().ok()?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "" => n, // bare number treated as seconds
+        _ => return None,
+    };
+    Some(std::time::Duration::from_secs(secs))
 }
 
 /// Entry point for `boom-sshh askpass`.
 ///
 /// Reads a JSON [`ApprovalRequest`] from stdin, then shows an interactive prompt:
 /// a terminal panel when a controlling terminal (`/dev/tty`) is available, or a
-/// native GUI dialog (zenity/kdialog/osascript) otherwise. Prints `allow` or
-/// `deny` to stdout. With no usable UI the request is denied (fail-closed).
+/// native GUI dialog (zenity/kdialog/osascript) otherwise. Prints the decision
+/// token (`allow`/`allow 5m`/`deny`, …) to stdout. With no usable UI the request
+/// is denied (fail-closed).
 pub fn run_askpass() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Read;
 
@@ -125,8 +190,29 @@ pub fn run_askpass() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut out = std::io::stdout();
     use std::io::Write;
-    writeln!(out, "{}", if decision { "allow" } else { "deny" })?;
+    writeln!(out, "{}", decision_token(&decision))?;
     Ok(())
+}
+
+/// Render an [`ApprovalDecision`] as the token the agent parses.
+pub fn decision_token(d: &ApprovalDecision) -> String {
+    if !d.allow {
+        return "deny".to_string();
+    }
+    match d.ttl {
+        None => "allow session".to_string(),
+        Some(t) => {
+            let s = t.as_secs();
+            let unit = if s % 3600 == 0 {
+                format!("{}h", s / 3600)
+            } else if s % 60 == 0 {
+                format!("{}m", s / 60)
+            } else {
+                format!("{s}s")
+            };
+            format!("allow {unit}")
+        }
+    }
 }
 
 /// Run a test approval request through the askpass UI.
@@ -148,6 +234,11 @@ pub fn run_approval_test(force_ui: Option<&str>) -> Result<(), Box<dyn std::erro
             "Test approval prompt".into(),
             "boom-sshh verification".into(),
         ],
+        key_fp: String::new(),
+        op: "test".into(),
+        host_label: None,
+        host_fp: None,
+        recent: Vec::new(),
     };
 
     let decision = if tty_usable() {
@@ -158,7 +249,7 @@ pub fn run_approval_test(force_ui: Option<&str>) -> Result<(), Box<dyn std::erro
 
     let mut out = std::io::stdout();
     use std::io::Write;
-    writeln!(out, "{}", if decision { "allow" } else { "deny" })?;
+    writeln!(out, "{}", decision_token(&decision))?;
     Ok(())
 }
 
@@ -257,7 +348,10 @@ fn tty_usable() -> bool {
 }
 
 /// Render an interactive approval panel on `/dev/tty`.
-fn prompt_tui(req: &ApprovalRequest) -> bool {
+///
+/// `a` allows (session-scoped); `d`/`q`/Esc deny. Output is the `allow`/`deny`
+/// token; duration presets live in the GUI approver.
+fn prompt_tui(req: &ApprovalRequest) -> ApprovalDecision {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -266,26 +360,26 @@ fn prompt_tui(req: &ApprovalRequest) -> bool {
 
     let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
         Ok(t) => t,
-        Err(_) => return false,
+        Err(_) => return ApprovalDecision { allow: false, ttl: None },
     };
     let raw = match termion::raw::IntoRawMode::into_raw_mode(tty) {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return ApprovalDecision { allow: false, ttl: None },
     };
     let alt = match raw.into_alternate_screen() {
         Ok(a) => a,
-        Err(_) => return false,
+        Err(_) => return ApprovalDecision { allow: false, ttl: None },
     };
     let backend = ratatui::backend::TermionBackend::new(alt);
     let mut terminal = match ratatui::Terminal::new(backend) {
         Ok(t) => t,
-        Err(_) => return false,
+        Err(_) => return ApprovalDecision { allow: false, ttl: None },
     };
 
     // Read keystrokes on a separate fd/thread so the countdown can tick.
     let reader = match std::fs::File::open("/dev/tty") {
         Ok(r) => r,
-        Err(_) => return false,
+        Err(_) => return ApprovalDecision { allow: false, ttl: None },
     };
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -302,7 +396,7 @@ fn prompt_tui(req: &ApprovalRequest) -> bool {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     let start = Instant::now();
-    let mut decision = false;
+    let mut decision = ApprovalDecision { allow: false, ttl: None };
     let mut done = false;
 
     let _ = terminal.clear();
@@ -363,24 +457,24 @@ fn prompt_tui(req: &ApprovalRequest) -> bool {
 
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(termion::event::Key::Char('a')) => {
-                decision = true;
+                decision = ApprovalDecision { allow: true, ttl: None };
                 done = true;
             }
             Ok(termion::event::Key::Char('d'))
             | Ok(termion::event::Key::Char('q'))
             | Ok(termion::event::Key::Esc) => {
-                decision = false;
+                decision = ApprovalDecision { allow: false, ttl: None };
                 done = true;
             }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if remaining <= 0.0 {
-                    decision = false;
+                    decision = ApprovalDecision { allow: false, ttl: None };
                     done = true;
                 }
             }
             Err(_) => {
-                decision = false;
+                decision = ApprovalDecision { allow: false, ttl: None };
                 done = true;
             }
         }
@@ -390,11 +484,26 @@ fn prompt_tui(req: &ApprovalRequest) -> bool {
     decision
 }
 
+/// Convert a button/label token into a decision (used by zenity extra buttons).
+fn label_to_decision(label: &str) -> ApprovalDecision {
+    let mut p = label.split_whitespace();
+    match p.next() {
+        Some("allow") => ApprovalDecision {
+            allow: true,
+            ttl: parse_duration(p.next().unwrap_or("session")),
+        },
+        _ => ApprovalDecision {
+            allow: false,
+            ttl: None,
+        },
+    }
+}
+
 /// Pop a native GUI dialog when no terminal is available.
 ///
-/// Prefers zenity (which supports a "Details" drill-down); otherwise kdialog /
-/// osascript. If no GUI tool is present the request is denied (fail-closed).
-fn prompt_gui(req: &ApprovalRequest) -> bool {
+/// Prefers zenity (duration presets + Details); otherwise kdialog / osascript.
+/// If no GUI tool is present the request is denied (fail-closed).
+fn prompt_gui(req: &ApprovalRequest) -> ApprovalDecision {
     let timeout = std::env::var("BOOM_SSHH_ASKPASS_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -407,7 +516,16 @@ fn prompt_gui(req: &ApprovalRequest) -> bool {
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
-    let text = format!("{} request\n\n{}", req.kind, gist);
+    let mut text = format!("{} request\n\n{}", req.kind, gist);
+    if !req.recent.is_empty() {
+        let recent = req
+            .recent
+            .iter()
+            .map(|c| format!("  $ {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push_str(&format!("\n\nRecent on this session:\n{recent}"));
+    }
 
     // Write the full request to a private temp file for the "Details" view.
     let detail_path = std::env::temp_dir().join(format!("boom-sshh-req-{}.json", std::process::id()));
@@ -424,12 +542,15 @@ fn prompt_gui(req: &ApprovalRequest) -> bool {
 
     let decision = if command_present("zenity") {
         zenity_approve(&text, timeout, &detail_path, wrote_detail)
+    } else if command_present("kdialog") {
+        kdialog_approve(&text, timeout)
+    } else if command_present("osascript") {
+        osascript_approve(&text)
     } else {
-        gui_approver_cmd(&text, timeout)
-            .map(|(prog, args)| std::process::Command::new(prog).args(args).status())
-            .and_then(|r| r.ok())
-            .map(|s| s.success())
-            .unwrap_or(false)
+        ApprovalDecision {
+            allow: false,
+            ttl: None,
+        }
     };
 
     if wrote_detail {
@@ -438,16 +559,16 @@ fn prompt_gui(req: &ApprovalRequest) -> bool {
     decision
 }
 
-/// zenity loop: shows the question dialog; if the user clicks "Details" it
-/// opens a scrollable text box with the full request and asks again.
-fn zenity_approve(text: &str, timeout: u64, detail_path: &std::path::Path, has_detail: bool) -> bool {
+/// zenity: question dialog with duration presets. "Details" re-opens the full
+/// request in a text box and asks again. OK/Cancel = Deny.
+fn zenity_approve(text: &str, timeout: u64, detail_path: &std::path::Path, has_detail: bool) -> ApprovalDecision {
     loop {
         let mut args: Vec<String> = vec![
             "--question".into(),
             "--title".into(),
             "boom-sshh".into(),
             "--ok-label".into(),
-            "Allow".into(),
+            "Deny".into(),
             "--cancel-label".into(),
             "Deny".into(),
             "--text".into(),
@@ -455,12 +576,15 @@ fn zenity_approve(text: &str, timeout: u64, detail_path: &std::path::Path, has_d
             "--timeout".into(),
             timeout.to_string(),
         ];
+        for b in ["Allow 5m", "Allow 1h", "Allow 12h", "Allow session"] {
+            args.push("--extra-button".into());
+            args.push(b.to_string());
+        }
         if has_detail {
             args.push("--extra-button".into());
             args.push("Details".into());
         }
-        let out = std::process::Command::new("zenity").args(&args).output().ok();
-        match out {
+        match std::process::Command::new("zenity").args(&args).output().ok() {
             Some(o) if o.status.success() => {
                 let label = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if label == "Details" {
@@ -477,36 +601,89 @@ fn zenity_approve(text: &str, timeout: u64, detail_path: &std::path::Path, has_d
                         ])
                         .arg(detail_path)
                         .status();
-                    return true; // Details reviewed = proceed
+                    continue;
                 }
-                return true;
+                return label_to_decision(&label);
             }
-            _ => return false,
+            _ => return ApprovalDecision {
+                allow: false,
+                ttl: None,
+            },
         }
     }
 }
 
-/// Choose the GUI approver program + args (kdialog / osascript).
-fn gui_approver_cmd(text: &str, timeout: u64) -> Option<(String, Vec<String>)> {
-    if command_present("kdialog") {
-        return Some((
-            "kdialog".into(),
-            vec![
-                "--title".into(),
-                "boom-sshh".into(),
-                "--yesno".into(),
-                text.into(),
-                timeout.to_string(),
-            ],
-        ));
+/// kdialog: menu with duration presets.
+fn kdialog_approve(text: &str, timeout: u64) -> ApprovalDecision {
+    let out = std::process::Command::new("kdialog")
+        .args([
+            "--title",
+            "boom-sshh",
+            "--menu",
+            text,
+            "5m",
+            "Allow 5m",
+            "1h",
+            "Allow 1h",
+            "12h",
+            "Allow 12h",
+            "session",
+            "Allow session",
+            "deny",
+            "Deny",
+            &timeout.to_string(),
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let tag = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            match tag.as_str() {
+                "5m" => ApprovalDecision {
+                    allow: true,
+                    ttl: Some(std::time::Duration::from_secs(300)),
+                },
+                "1h" => ApprovalDecision {
+                    allow: true,
+                    ttl: Some(std::time::Duration::from_secs(3600)),
+                },
+                "12h" => ApprovalDecision {
+                    allow: true,
+                    ttl: Some(std::time::Duration::from_secs(43200)),
+                },
+                "session" => ApprovalDecision {
+                    allow: true,
+                    ttl: None,
+                },
+                _ => ApprovalDecision {
+                    allow: false,
+                    ttl: None,
+                },
+            }
+        }
+        _ => ApprovalDecision {
+            allow: false,
+            ttl: None,
+        },
     }
-    if command_present("osascript") {
-        let detail_arg = format!(
-            "display dialog \"boom-sshh request\" buttons {{\"Deny\", \"Allow\"}} default button \"Allow\""
-        );
-        return Some(("osascript".into(), vec!["-e".into(), detail_arg]));
+}
+
+/// osascript: simple Allow/Deny (session-scoped allow).
+fn osascript_approve(text: &str) -> ApprovalDecision {
+    let script = format!(
+        "display dialog \"boom-sshh request: {}\" buttons {{\"Deny\", \"Allow\"}} default button \"Allow\"",
+        text.replace('"', "'")
+    );
+    let out = std::process::Command::new("osascript").args(["-e", &script]).output();
+    match out {
+        Ok(o) if o.status.success() => ApprovalDecision {
+            allow: true,
+            ttl: None,
+        },
+        _ => ApprovalDecision {
+            allow: false,
+            ttl: None,
+        },
     }
-    None
 }
 
 /// True if `name` resolves on PATH.

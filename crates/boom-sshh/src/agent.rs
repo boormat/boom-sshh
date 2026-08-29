@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -43,6 +43,68 @@ struct SessionBindingInfo {
     verified: bool,
 }
 
+/// Classification of what a sign request is signing, inferred from the bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+enum Op {
+    GitCommit,
+    GitTag,
+    SshUserAuth,
+    Unknown,
+}
+
+impl Op {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Op::GitCommit => "git-commit",
+            Op::GitTag => "git-tag",
+            Op::SshUserAuth => "ssh-userauth",
+            Op::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+enum Action {
+    Allow,
+    Deny,
+}
+
+/// A single in-memory approval rule. `None` for a matcher field means "any".
+/// `host_fp: Some(None)` matches only unbound (no destination) signs.
+struct Rule {
+    key_fp: Option<String>,
+    op: Option<Op>,
+    host_fp: Option<Option<String>>,
+    action: Action,
+    /// `None` = valid until the agent exits (session-scoped).
+    expires_at: Option<Instant>,
+}
+
+impl Rule {
+    /// Higher = more specific match (fewer `None` matchers).
+    fn specificity(&self) -> usize {
+        self.key_fp.is_some() as usize + self.op.is_some() as usize + self.host_fp.is_some() as usize
+    }
+}
+
+/// One recently logged command on this session, tagged with the bound host so
+/// sign prompts can show host-scoped context. Display only — never authorizes.
+#[derive(Clone)]
+struct RecentEntry {
+    at: Instant,
+    command: String,
+    host_fp: Option<String>,
+}
+
+/// Context used to evaluate a sign request against the policy.
+struct SignContext {
+    key_fp: String,
+    op: Op,
+    host_fp: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct HistoryAgent {
     keys: Arc<Mutex<Vec<StoredKey>>>,
@@ -53,17 +115,103 @@ pub struct HistoryAgent {
     peer: Option<(u32, u32)>,
     /// Last command per PID for dedup (24h eviction).
     last_commands: Arc<Mutex<HashMap<u32, LastCommand>>>,
+    /// In-memory approval policy, shared across all sessions.
+    policy: Arc<Mutex<Vec<Rule>>>,
+    /// Recently logged commands for this session (display context only).
+    recent: VecDeque<RecentEntry>,
+    /// Hostname captured from the first HISTORY line of this session.
+    host_label: Option<String>,
 }
 
 impl HistoryAgent {
     pub fn new(histfile: File) -> Self {
+        // Default policy: git commit/tag signing is allowed without a prompt.
+        // It is local (no remote destination) and low risk — equivalent to a
+        // stock ssh-agent that holds the key. ssh-userauth signs still require
+        // an explicit, time-bounded approval (stored on first use).
+        let mut policy = Vec::new();
+        for op in [Op::GitCommit, Op::GitTag] {
+            policy.push(Rule {
+                key_fp: None,
+                op: Some(op),
+                host_fp: None,
+                action: Action::Allow,
+                expires_at: None,
+            });
+        }
+
         Self {
             keys: Arc::new(Mutex::new(Vec::new())),
             histfile: Arc::new(Mutex::new(histfile)),
             session_binding: None,
             peer: None,
             last_commands: Arc::new(Mutex::new(HashMap::new())),
+            policy: Arc::new(Mutex::new(policy)),
+            recent: VecDeque::new(),
+            host_label: None,
         }
+    }
+
+    /// Classify a sign request by inspecting the raw bytes being signed.
+    ///
+    /// Git commit objects start with `tree `, tag objects with `object `;
+    /// OpenSSH's `ssh-keygen -Y sign` wraps the data in an SSH signature
+    /// envelope (`"SSHSIG"` + namespace `"git"`); we detect that too.
+    /// An ssh userauth signature contains the `"ssh-connection"` service name
+    /// string somewhere in the blob. Anything else is `Unknown` (prompts)
+    /// rather than being silently allowed.
+    fn classify_op(data: &[u8]) -> Op {
+        if data.starts_with(b"tree ") {
+            Op::GitCommit
+        } else if data.starts_with(b"object ") {
+            Op::GitTag
+        } else if data.starts_with(b"SSHSIG")
+            && data.len() > 13
+            && &data[6..13] == b"\x00\x00\x00\x03git"
+        {
+            // SSH signature envelope with namespace "git" (git commit/tag)
+            Op::GitCommit
+        } else if data.windows(14).any(|w| w == b"ssh-connection") {
+            Op::SshUserAuth
+        } else {
+            Op::Unknown
+        }
+    }
+
+    /// Evaluate the context against the in-memory policy. Expired rules are
+    /// dropped. Returns `None` when no rule matches (caller must prompt).
+    fn evaluate(&self, ctx: &SignContext) -> Option<Action> {
+        let mut policy = self.policy.lock().unwrap();
+        let now = Instant::now();
+        policy.retain(|r| r.expires_at.map_or(true, |e| e > now));
+
+        let mut best: Option<(usize, Action)> = None;
+        for r in policy.iter() {
+            if let Some(k) = &r.key_fp {
+                if k != &ctx.key_fp {
+                    continue;
+                }
+            }
+            if let Some(o) = r.op {
+                if o != ctx.op {
+                    continue;
+                }
+            }
+            let host_ok = match &r.host_fp {
+                Some(Some(h)) => ctx.host_fp.as_ref().map_or(false, |c| c == h),
+                Some(None) => ctx.host_fp.is_none(),
+                None => true,
+            };
+            if !host_ok {
+                continue;
+            }
+            let spec = r.specificity();
+            match best {
+                Some((s, _)) if s >= spec => {}
+                _ => best = Some((spec, r.action)),
+            }
+        }
+        best.map(|(_, a)| a)
     }
 
     fn find_key(&self, pubkey: &PublicKey) -> Option<StoredKey> {
@@ -154,15 +302,92 @@ impl Session for HistoryAgent {
             .map(|(p, u)| format!("{p}/{u}"))
             .unwrap_or_else(|| "?".to_string());
         let bound = self.session_binding.is_some();
+        let op = Self::classify_op(&request.data);
+        let host_fp = self.session_binding.as_ref().map(|b| b.host_fp.clone());
+        let session_hex = self
+            .session_binding
+            .as_ref()
+            .map(|b| b.session_id_hex.clone())
+            .unwrap_or_default();
+        let host_display = self
+            .host_label
+            .clone()
+            .or_else(|| host_fp.clone())
+            .unwrap_or_else(|| "?".to_string());
 
-        // Sign like a standard ssh-agent: no per-signature approval prompt, so
-        // interactive ssh stays passwordless. The sensitive operations
-        // (session-bind and destination-constraint registration) remain gated
-        // by approval and fail closed when no approver is reachable.
+        let ctx = SignContext {
+            key_fp: key_fp.clone(),
+            op,
+            host_fp: host_fp.clone(),
+        };
+
+        // Recent, host-scoped commands for display context (no authorization).
+        let recent: Vec<String> = {
+            let now = Instant::now();
+            let mut v: Vec<String> = self
+                .recent
+                .iter()
+                .filter(|e| host_fp.as_ref().map_or(true, |h| e.host_fp.as_ref() == Some(h)))
+                .filter(|e| now.duration_since(e.at) < Duration::from_secs(30))
+                .map(|e| e.command.clone())
+                .collect();
+            v.truncate(3);
+            v
+        };
+
+        // Evaluate the in-memory policy. No match → prompt; unreachable approver
+        // fails closed (deny). An explicit allow stores a time-bounded rule so
+        // repeated signs in the same window are silent.
+        let decision = match self.evaluate(&ctx) {
+            Some(Action::Allow) => true,
+            Some(Action::Deny) => false,
+            None => {
+                let req = ApprovalRequest {
+                    kind: "sign".to_string(),
+                    timestamp: now_secs(),
+                    summary: vec![
+                        format!("key: {key_fp}"),
+                        format!("op: {}", op.as_str()),
+                        format!("host: {host_display}"),
+                    ],
+                    key_fp: key_fp.clone(),
+                    op: op.as_str().to_string(),
+                    host_label: self.host_label.clone(),
+                    host_fp: host_fp.clone(),
+                    recent: recent.clone(),
+                };
+                match request_approval(&req).await {
+                    Some(d) if d.allow => {
+                        let rule = Rule {
+                            key_fp: Some(ctx.key_fp.clone()),
+                            op: Some(ctx.op),
+                            host_fp: Some(ctx.host_fp.clone()),
+                            action: Action::Allow,
+                            expires_at: d.ttl.map(|t| Instant::now() + t),
+                        };
+                        self.policy.lock().unwrap().push(rule);
+                        true
+                    }
+                    Some(_) => false,
+                    None => false,
+                }
+            }
+        };
+
         self.write_audit(&format!(
-            "SIGN key={key_fp} peer={peer} bound={} decision=allow",
-            bound as u8
+            "SIGN key={key_fp} peer={peer} bound={} op={} host={} session={} decision={}",
+            bound as u8,
+            op.as_str(),
+            host_display,
+            session_hex,
+            if decision { "allow" } else { "deny" }
         ));
+
+        if !decision {
+            return Err(AgentError::other(std::io::Error::other(
+                "signing denied by policy",
+            )));
+        }
 
         match identity.privkey.key_data() {
             KeypairData::Ed25519(key) => {
@@ -269,8 +494,13 @@ impl Session for HistoryAgent {
                 kind: "dest-constraint".to_string(),
                 timestamp: now_secs(),
                 summary,
+                key_fp: key_fp.clone(),
+                op: String::new(),
+                host_label: None,
+                host_fp: None,
+                recent: Vec::new(),
             };
-            let allowed = matches!(request_approval(&req).await, Some(true));
+            let allowed = matches!(request_approval(&req).await, Some(d) if d.allow);
             self.write_audit(&format!(
                 "DEST-CONSTRAINT key={key_fp} constraints={} decision={}",
                 rd.constraints.len(),
@@ -330,6 +560,24 @@ impl Session for HistoryAgent {
                 };
                 let line = format!("#{ts} {contents}{bind_suffix}\n");
 
+                // Keep a short, host-tagged ring of recent commands for sign
+                // prompt context (display only; never used to authorize).
+                let host_fp = self.session_binding.as_ref().map(|b| b.host_fp.clone());
+                self.recent.push_back(RecentEntry {
+                    at: Instant::now(),
+                    command: contents.clone(),
+                    host_fp,
+                });
+                if self.recent.len() > 20 {
+                    self.recent.pop_front();
+                }
+                if self.host_label.is_none() {
+                    let label = contents.split_whitespace().next().unwrap_or("").to_string();
+                    if !label.is_empty() {
+                        self.host_label = Some(label);
+                    }
+                }
+
                 let mut histfile = self.histfile.lock().unwrap();
                 histfile
                     .write_all(line.as_bytes())
@@ -357,8 +605,13 @@ impl Session for HistoryAgent {
                     kind: "session-bind".to_string(),
                     timestamp: now_secs(),
                     summary,
+                    key_fp: String::new(),
+                    op: String::new(),
+                    host_label: None,
+                    host_fp: Some(host_fp.clone()),
+                    recent: Vec::new(),
                 };
-                let allowed = matches!(request_approval(&req).await, Some(true));
+                let allowed = matches!(request_approval(&req).await, Some(d) if d.allow);
                 self.write_audit(&format!(
                     "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision={}",
                     bind.is_forwarding as u8,
@@ -614,5 +867,118 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&script);
         std::env::remove_var("BOOM_SSHH_ASKPASS");
+    }
+
+    #[test]
+    fn test_classify_op() {
+        // Git commit object begins with "tree ".
+        assert_eq!(
+            HistoryAgent::classify_op(b"tree 0123456789abcdef\nparent ...\nauthor ..."),
+            Op::GitCommit
+        );
+        // Git tag object begins with "object ".
+        assert_eq!(
+            HistoryAgent::classify_op(b"object 0123\n type tag\n tag v1\n"),
+            Op::GitTag
+        );
+        // OpenSSH ssh-keygen -Y sign wraps data in an SSH signature envelope:
+        // string "SSHSIG" + string "git" (namespace) + ...
+        let mut envelope = b"SSHSIG".to_vec();
+        envelope.extend_from_slice(&[0x00, 0x00, 0x00, 0x03]); // namespace len
+        envelope.extend_from_slice(b"git");
+        envelope.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // reserved
+        assert_eq!(HistoryAgent::classify_op(&envelope), Op::GitCommit);
+        // SSH userauth signature blob contains "ssh-connection" service name.
+        let mut ua = Vec::with_capacity(128);
+        ua.extend_from_slice(&[0x00, 0x00, 0x00, 0x40]); // session-id len=64
+        ua.extend_from_slice(&[0x42; 64]);                 // session-id body
+        ua.push(0x32);                                      // SSH_MSG_USERAUTH_REQUEST
+        ua.extend_from_slice(&[0x00, 0x00, 0x00, 0x03]);  // username len
+        ua.extend_from_slice(b"mat");
+        ua.extend_from_slice(&[0x00, 0x00, 0x00, 0x0e]);  // service len=14
+        ua.extend_from_slice(b"ssh-connection");
+        assert_eq!(HistoryAgent::classify_op(&ua), Op::SshUserAuth);
+        // Unrecognized content is Unknown (prompts), never silently allowed.
+        assert_eq!(HistoryAgent::classify_op(b"hello world"), Op::Unknown);
+    }
+
+    #[test]
+    fn test_policy_default_allows_git_sign() {
+        let (f, path) = test_histfile();
+        let agent = HistoryAgent::new(f);
+
+        // Git commit/tag signs are allowed by the seeded default rule.
+        assert_eq!(
+            agent.evaluate(&SignContext {
+                key_fp: "k1".into(),
+                op: Op::GitCommit,
+                host_fp: None,
+            }),
+            Some(Action::Allow)
+        );
+        assert_eq!(
+            agent.evaluate(&SignContext {
+                key_fp: "k1".into(),
+                op: Op::GitTag,
+                host_fp: None,
+            }),
+            Some(Action::Allow)
+        );
+        // ssh-userauth has no rule yet → prompt (None).
+        assert_eq!(
+            agent.evaluate(&SignContext {
+                key_fp: "k1".into(),
+                op: Op::SshUserAuth,
+                host_fp: Some("hostfp".into()),
+            }),
+            None
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_policy_specificity_and_ttl() {
+        let (f, path) = test_histfile();
+        let agent = HistoryAgent::new(f);
+
+        let host = "hostfp".to_string();
+        // Allow ssh-userauth to `host` for this session only (no expiry).
+        agent.policy.lock().unwrap().push(Rule {
+            key_fp: Some("k1".into()),
+            op: Some(Op::SshUserAuth),
+            host_fp: Some(Some(host.clone())),
+            action: Action::Allow,
+            expires_at: None,
+        });
+
+        let ctx_host = SignContext {
+            key_fp: "k1".into(),
+            op: Op::SshUserAuth,
+            host_fp: Some(host.clone()),
+        };
+        let ctx_other = SignContext {
+            key_fp: "k1".into(),
+            op: Op::SshUserAuth,
+            host_fp: Some("other".into()),
+        };
+
+        assert_eq!(agent.evaluate(&ctx_host), Some(Action::Allow));
+        // A different host still has no rule → prompt.
+        assert_eq!(agent.evaluate(&ctx_other), None);
+
+        // Expired rule is dropped and no longer matches.
+        {
+            let mut pol = agent.policy.lock().unwrap();
+            pol.push(Rule {
+                key_fp: None,
+                op: Some(Op::SshUserAuth),
+                host_fp: None,
+                action: Action::Allow,
+                expires_at: Some(std::time::Instant::now() - Duration::from_secs(1)),
+            });
+        }
+        assert_eq!(agent.evaluate(&ctx_host), Some(Action::Allow)); // still matched by session rule
+        assert_eq!(agent.evaluate(&ctx_other), None); // expired catch-all dropped
+        let _ = fs::remove_file(&path);
     }
 }

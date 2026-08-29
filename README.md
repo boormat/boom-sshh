@@ -107,7 +107,7 @@ boom-sshh test-approval --force-gui  # force GUI dialog (zenity/kdialog)
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
-| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for session-bind / destination-constraint / sign prompts. Executes the given command; exit 0 = allow, non-zero = deny. |
+| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for session-bind / destination-constraint / sign prompts. Executes the given command; prints `allow`, `allow 5m` / `allow 1h` / `allow 12h` / `allow session`, or `deny` to stdout. |
 | `BOOM_SSHH_ASKPASS_TIMEOUT` | `60` | Approver timeout in seconds. |
 
 ```bash
@@ -174,6 +174,44 @@ cargo test
 export TEST_SSH_AUTH_SOCK=/tmp/test-agent.sock
 ./target/release/boom-sshh agent
 ```
+
+## Signing approval policy
+
+Every signature request is checked against an **in-memory** policy (never written
+to disk; reset when the agent exits). Git commit/tag signing is allowed by
+default; an `ssh-userauth` signature (ssh/scp/ansible/git push-pull) requires an
+explicit, time-bounded approval the first time it is seen.
+
+When no rule matches, the agent prompts via `BOOM_SSHH_ASKPASS` (the default
+`boom-sshh askpass` shows a GUI dialog with zenity/kdialog when available, or a
+TUI panel on `/dev/tty`). The response can carry a duration:
+
+| Response            | Meaning                                            |
+|---|---|
+| `allow session`     | Allow, valid until the agent exits (default)      |
+| `allow 5m`          | Allow for 5 minutes                                |
+| `allow 1h`          | Allow for 1 hour                                   |
+| `allow 12h`         | Allow for 12 hours                                 |
+| `deny`              | Deny                                               |
+
+The stored rule is keyed on the key fingerprint, operation class
+(`git-commit` / `git-tag` / `ssh-userauth`), and destination host (from
+`session-bind`). So approving `ssh-userauth` to a host for `1h` makes subsequent
+connections to that host in the next hour silent — which is what lets an ansible
+run over many hosts proceed after a single approval.
+
+If no approver can be reached (e.g. a headless session with no GUI), the request
+**fails closed** (denied) rather than prompting — set `BOOM_SSHH_ASKPASS=true`
+only as a deliberate "always allow" security-off switch.
+
+Security notes:
+- Policy lives only in the agent process; there is no on-disk policy file to
+  tamper with, and a restart returns to "prompt everything".
+- The TTL bounds how long a delegation lasts (e.g. grant an AI agent limited
+  access for a short window).
+- The agent socket is the trust boundary; policy restricts by key/op/host. It
+  does **not** inspect the calling process (`/proc`), so a rule for a host is
+  usable by any local process that can reach the socket during its TTL.
 
 ## Project structure
 
