@@ -12,7 +12,9 @@
 ## Release / install
 - End-user one-line install pulls `install.sh` from the latest release and runs it:
   `curl -fsSL https://github.com/boormat/boom-sshh/releases/latest/download/install.sh | sh`
-- `install.sh` installs the `boom-sshh` agent and extracts the `boom-sshend` client locally.
+- `install.sh` downloads the binary to a local temp dir, then runs `boom-sshh init-agent` which
+  extracts the embedded `boom-sshend` client, copies the agent binary into place, and sets up
+  a shell trap for automatic agent startup.
 
 ## Notes
 - Client binary is `boom-sshend` (the per-command sender); agent binary is `boom-sshh`.

@@ -1,7 +1,10 @@
 #!/bin/sh
+# Usage:
+#   curl -fsSL https://github.com/boormat/boom-sshh/releases/latest/download/install.sh | sh
 set -eu
 
 REPO="boormat/boom-sshh"
+BASE_URL="https://github.com/${REPO}/releases/latest/download"
 
 # --- Detect OS ---
 OS=$(uname -s)
@@ -20,25 +23,15 @@ case "$ARCH" in
 esac
 
 BIN="boom-sshh-${OS_NAME}-${ARCH_NAME}"
-
-# --- Get latest release tag ---
-TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep '"tag_name"' | head -1 | cut -d '"' -f 4)
-
-if [ -z "$TAG" ]; then
-  echo "error: could not determine latest release"
-  exit 1
-fi
-
-echo "latest release: ${TAG}"
-echo "asset: ${BIN}"
+echo "asset: ${BASE_URL}/${BIN}"
 
 # --- Download binary + checksums ---
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+# tempdir is local so no exec squash of /tmp
+TMP=$(mktemp -d -p .)
+trap 'rm -r "$TMP"' EXIT
+TMPBIN="${TMP}/${BIN}"
 
-BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
-curl -fsSL "${BASE_URL}/${BIN}"              -o "${TMP}/${BIN}"
+curl -fsSL "${BASE_URL}/${BIN}"              -o "${TMPBIN}"
 curl -fsSL "${BASE_URL}/checksums.txt"       -o "${TMP}/checksums.txt"
 
 # --- Verify SHA256 ---
@@ -48,25 +41,9 @@ curl -fsSL "${BASE_URL}/checksums.txt"       -o "${TMP}/checksums.txt"
 }
 
 # --- Install ---
-INSTALL_DIR="/usr/local/bin"
-if [ ! -w "$INSTALL_DIR" ] 2>/dev/null; then
-  INSTALL_DIR="$HOME/.local/bin"
-  mkdir -p "$INSTALL_DIR"
-fi
-
-install -m 0755 "${TMP}/${BIN}" "${INSTALL_DIR}/boom-sshh"
-
+chmod u+x "${TMPBIN}"
 echo ""
-echo "installed ${INSTALL_DIR}/boom-sshh"
+echo "installing $(${TMPBIN} version)"
+"${TMPBIN}" init-agent
 
-# --- Install boom-sshend client (extracted from the agent) ---
-CLIENT_ARCH="${ARCH_NAME}-${OS_NAME}"
-if "${INSTALL_DIR}/boom-sshh" extract-client "${CLIENT_ARCH}" "${INSTALL_DIR}/boom-sshend" 2>/dev/null; then
-  echo "installed ${INSTALL_DIR}/boom-sshend"
-else
-  echo "warning: could not extract boom-sshend client (not embedded in this build)"
-fi
-echo ""
-echo "next steps:"
-echo "  eval \$(boom-sshh agent)"
 echo "  boom-sshh init user@remote-host"
