@@ -1,8 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
 
 use async_trait::async_trait;
 use ssh_agent_lib::agent::{Agent, Session};
@@ -18,7 +21,7 @@ use ssh_key::public::KeyData;
 use ssh_key::{HashAlg, PrivateKey, PublicKey, Signature};
 use tokio::net::UnixListener;
 
-use crate::approval::{request_approval, ApprovalRequest};
+use crate::approval::{request_approval, ApprovalOutcome, ApprovalRequest};
 
 #[derive(Clone)]
 struct StoredKey {
@@ -73,13 +76,16 @@ enum Action {
 
 /// A single in-memory approval rule. `None` for a matcher field means "any".
 /// `host_fp: Some(None)` matches only unbound (no destination) signs.
-struct Rule {
+pub(crate) struct Rule {
     key_fp: Option<String>,
     op: Option<Op>,
     host_fp: Option<Option<String>>,
     action: Action,
     /// `None` = valid until the agent exits (session-scoped).
     expires_at: Option<Instant>,
+    /// `true` for rules seeded by default policy (git commit/tag). User-accepted
+    /// rules are `false` and are the only ones `policy clear` may drop.
+    pub(crate) builtin: bool,
 }
 
 impl Rule {
@@ -109,6 +115,8 @@ struct SignContext {
 pub struct HistoryAgent {
     keys: Arc<Mutex<Vec<StoredKey>>>,
     histfile: Arc<Mutex<File>>,
+    /// Separate, append-only log of approval decisions (distinct from history).
+    authfile: Option<Arc<Mutex<File>>>,
     /// Set when a `session-bind@openssh.com` is accepted on this connection.
     session_binding: Option<SessionBindingInfo>,
     /// PID/UID of the process on the other end of the agent socket.
@@ -116,9 +124,10 @@ pub struct HistoryAgent {
     /// Last command per PID for dedup (24h eviction).
     last_commands: Arc<Mutex<HashMap<u32, LastCommand>>>,
     /// In-memory approval policy, shared across all sessions.
-    policy: Arc<Mutex<Vec<Rule>>>,
-    /// Recently logged commands for this session (display context only).
-    recent: VecDeque<RecentEntry>,
+    pub(crate) policy: Arc<Mutex<Vec<Rule>>>,
+    /// Recently logged commands (display context + trigger correlation).
+    /// Shared across connections so a sign can find the command that triggered it.
+    recent: Arc<Mutex<VecDeque<RecentEntry>>>,
     /// Hostname captured from the first HISTORY line of this session.
     host_label: Option<String>,
 }
@@ -137,19 +146,26 @@ impl HistoryAgent {
                 host_fp: None,
                 action: Action::Allow,
                 expires_at: None,
+                builtin: true,
             });
         }
 
         Self {
             keys: Arc::new(Mutex::new(Vec::new())),
             histfile: Arc::new(Mutex::new(histfile)),
+            authfile: None,
             session_binding: None,
             peer: None,
             last_commands: Arc::new(Mutex::new(HashMap::new())),
             policy: Arc::new(Mutex::new(policy)),
-            recent: VecDeque::new(),
+            recent: Arc::new(Mutex::new(VecDeque::new())),
             host_label: None,
         }
+    }
+
+    /// Attach the separate auth log file. Called by the daemon before serving.
+    pub fn set_authfile(&mut self, f: File) {
+        self.authfile = Some(Arc::new(Mutex::new(f)));
     }
 
     /// Classify a sign request by inspecting the raw bytes being signed.
@@ -247,6 +263,34 @@ impl HistoryAgent {
         }
     }
 
+    /// Append one JSON decision record to the separate auth log.
+    ///
+    /// `ts` is the request arrival time (captured before any prompt), so the
+    /// log reflects *when it came in*, not when the user clicked the pop-up.
+    fn write_auth(&self, ev: &AuthEvent) {
+        if let Some(af) = &self.authfile {
+            if let Ok(mut f) = af.lock() {
+                if let Ok(line) = serde_json::to_string(ev) {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
+    }
+
+    /// Best guess at the shell command that triggered this approval: the most
+    /// recent HISTORY entry (host-matched when a destination is bound).
+    fn trigger_cmd(&self, host_fp: Option<&String>) -> Option<String> {
+        let r = self.recent.lock().unwrap();
+        if r.is_empty() {
+            return None;
+        }
+        let candidates: Vec<&RecentEntry> = match host_fp {
+            Some(h) => r.iter().filter(|e| e.host_fp.as_ref() == Some(h)).collect(),
+            None => r.iter().collect(),
+        };
+        candidates.last().map(|e| e.command.clone())
+    }
+
     fn remove_key(&self, pubkey: &PublicKey) -> bool {
         let mut keys = self.keys.lock().unwrap();
         if let Some(pos) = keys.iter().position(|k| &k.pubkey == pubkey) {
@@ -263,6 +307,109 @@ fn now_secs() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// One decision recorded in the auth log (`~/.boom-sshh/auth.log`, JSONL).
+#[derive(Serialize)]
+struct AuthEvent {
+    /// Request arrival time (epoch secs) — before any prompt.
+    ts: u64,
+    /// Time the decision was returned (epoch secs) — after the prompt/timeout.
+    decided_at: u64,
+    /// `sign` | `session-bind` | `dest-constraint`.
+    kind: String,
+    /// Operation class for `sign` (git-commit/git-tag/ssh-userauth/unknown).
+    op: String,
+    key_fp: String,
+    host: String,
+    peer: String,
+    /// `allow` | `deny`.
+    decision: &'static str,
+    /// `policy` | `askpass-allow` | `askpass-deny` | `fail-closed:<reason>`.
+    basis: String,
+    /// `tui` | `gui` | `none` | `policy` | `auto`.
+    ui: String,
+    /// Whether an approver was actually spawned/contacted.
+    askpass_reached: bool,
+    /// The history command that probably triggered this request.
+    trigger_cmd: Option<String>,
+}
+
+/// A remembered accept, mirrored to `~/.boom-sshh/policy.json` for `policy list`.
+#[derive(Serialize, Deserialize)]
+pub struct ApprovedRule {
+    pub id: String,
+    pub key_fp: String,
+    pub op: String,
+    /// `any` | `unbound` | `<host-fp>`.
+    pub host: String,
+    pub expires_in_secs: Option<u64>,
+    pub builtin: bool,
+}
+
+/// Directory holding boom-sshh's local state (`~/.boom-sshh`).
+fn boom_sshh_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join(".boom-sshh")
+}
+
+/// Path of the remembered-accepts snapshot used by `policy list`.
+pub fn policy_snapshot_path() -> PathBuf {
+    boom_sshh_dir().join("policy.json")
+}
+
+/// Rewrite the remembered-accepts snapshot from the live policy.
+///
+/// Only non-`builtin` rules are mirrored; `policy clear` drops exactly those.
+pub fn write_policy_snapshot(policy: &Arc<Mutex<Vec<Rule>>>) {
+    let dir = boom_sshh_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("policy.json");
+    let rules: Vec<ApprovedRule> = policy
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| !r.builtin)
+        .map(|r| {
+            let op = r.op.map(|o| o.as_str()).unwrap_or("any").to_string();
+            let host = match &r.host_fp {
+                Some(Some(h)) => h.clone(),
+                Some(None) => "unbound".to_string(),
+                None => "any".to_string(),
+            };
+            let expires_in_secs = r
+                .expires_at
+                .map(|e| e.saturating_duration_since(Instant::now()).as_secs());
+            ApprovedRule {
+                id: rule_id(&r.key_fp.clone().unwrap_or_default(), &op, &host),
+                key_fp: r.key_fp.clone().unwrap_or_default(),
+                op,
+                host,
+                expires_in_secs,
+                builtin: r.builtin,
+            }
+        })
+        .collect();
+    if let Ok(s) = serde_json::to_string_pretty(&rules) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
+/// Stable id for a rule (key_fp|op|host) so `policy list` can show it.
+fn rule_id(key_fp: &str, op: &str, host: &str) -> String {
+    let mut h: u64 = 1469598103934665603; // FNV-1a offset basis
+    for b in key_fp
+        .as_bytes()
+        .iter()
+        .chain(op.as_bytes())
+        .chain(host.as_bytes())
+    {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{h:016x}")
 }
 
 fn fp_of_keydata(kd: &KeyData) -> String {
@@ -324,8 +471,8 @@ impl Session for HistoryAgent {
         // Recent, host-scoped commands for display context (no authorization).
         let recent: Vec<String> = {
             let now = Instant::now();
-            let mut v: Vec<String> = self
-                .recent
+            let r = self.recent.lock().unwrap();
+            let mut v: Vec<String> = r
                 .iter()
                 .filter(|e| host_fp.as_ref().map_or(true, |h| e.host_fp.as_ref() == Some(h)))
                 .filter(|e| now.duration_since(e.at) < Duration::from_secs(30))
@@ -337,14 +484,49 @@ impl Session for HistoryAgent {
 
         // Evaluate the in-memory policy. No match → prompt; unreachable approver
         // fails closed (deny). An explicit allow stores a time-bounded rule so
-        // repeated signs in the same window are silent.
+        // repeated signs in the same window are silent. Denies are NEVER stored —
+        // only accepts are remembered, so the user can always change their mind
+        // by simply re-running the command (a fresh prompt) or clearing accepts.
+        let incoming = now_secs();
         let decision = match self.evaluate(&ctx) {
-            Some(Action::Allow) => true,
-            Some(Action::Deny) => false,
+            Some(Action::Allow) => {
+                self.write_auth(&AuthEvent {
+                    ts: incoming,
+                    decided_at: incoming,
+                    kind: "sign".into(),
+                    op: op.as_str().into(),
+                    key_fp: key_fp.clone(),
+                    host: host_display.clone(),
+                    peer: peer.clone(),
+                    decision: "allow",
+                    basis: "policy".into(),
+                    ui: "policy".into(),
+                    askpass_reached: false,
+                    trigger_cmd: self.trigger_cmd(host_fp.as_ref()),
+                });
+                true
+            }
+            Some(Action::Deny) => {
+                self.write_auth(&AuthEvent {
+                    ts: incoming,
+                    decided_at: incoming,
+                    kind: "sign".into(),
+                    op: op.as_str().into(),
+                    key_fp: key_fp.clone(),
+                    host: host_display.clone(),
+                    peer: peer.clone(),
+                    decision: "deny",
+                    basis: "policy".into(),
+                    ui: "policy".into(),
+                    askpass_reached: false,
+                    trigger_cmd: self.trigger_cmd(host_fp.as_ref()),
+                });
+                false
+            }
             None => {
                 let req = ApprovalRequest {
                     kind: "sign".to_string(),
-                    timestamp: now_secs(),
+                    timestamp: incoming,
                     summary: vec![
                         format!("key: {key_fp}"),
                         format!("op: {}", op.as_str()),
@@ -356,21 +538,43 @@ impl Session for HistoryAgent {
                     host_fp: host_fp.clone(),
                     recent: recent.clone(),
                 };
-                match request_approval(&req).await {
-                    Some(d) if d.allow => {
+                let outcome = request_approval(&req).await;
+                let decided_at = now_secs();
+                let trigger = self.trigger_cmd(host_fp.as_ref());
+                let (allow, basis) = match &outcome.outcome {
+                    ApprovalOutcome::Allow { ttl } => {
                         let rule = Rule {
                             key_fp: Some(ctx.key_fp.clone()),
                             op: Some(ctx.op),
                             host_fp: Some(ctx.host_fp.clone()),
                             action: Action::Allow,
-                            expires_at: d.ttl.map(|t| Instant::now() + t),
+                            expires_at: ttl.map(|t| Instant::now() + t),
+                            builtin: false,
                         };
                         self.policy.lock().unwrap().push(rule);
-                        true
+                        write_policy_snapshot(&self.policy);
+                        (true, "askpass-allow".to_string())
                     }
-                    Some(_) => false,
-                    None => false,
-                }
+                    ApprovalOutcome::Deny => (false, "askpass-deny".to_string()),
+                    ApprovalOutcome::Unreachable { reason } => {
+                        (false, format!("fail-closed:{reason}"))
+                    }
+                };
+                self.write_auth(&AuthEvent {
+                    ts: incoming,
+                    decided_at,
+                    kind: "sign".into(),
+                    op: op.as_str().into(),
+                    key_fp: key_fp.clone(),
+                    host: host_display.clone(),
+                    peer: peer.clone(),
+                    decision: if allow { "allow" } else { "deny" },
+                    basis,
+                    ui: outcome.ui.to_string(),
+                    askpass_reached: outcome.reached,
+                    trigger_cmd: trigger,
+                });
+                allow
             }
         };
 
@@ -500,7 +704,34 @@ impl Session for HistoryAgent {
                 host_fp: None,
                 recent: Vec::new(),
             };
-            let allowed = matches!(request_approval(&req).await, Some(d) if d.allow);
+            let peer = self
+                .peer
+                .map(|(p, u)| format!("{p}/{u}"))
+                .unwrap_or_else(|| "?".to_string());
+            let incoming = req.timestamp;
+            let outcome = request_approval(&req).await;
+            let decided_at = now_secs();
+            let trigger = self.trigger_cmd(None);
+            let allowed = matches!(&outcome.outcome, ApprovalOutcome::Allow { .. });
+            let basis = match &outcome.outcome {
+                ApprovalOutcome::Allow { .. } => "askpass-allow".to_string(),
+                ApprovalOutcome::Deny => "askpass-deny".to_string(),
+                ApprovalOutcome::Unreachable { reason } => format!("fail-closed:{reason}"),
+            };
+            self.write_auth(&AuthEvent {
+                ts: incoming,
+                decided_at,
+                kind: "dest-constraint".into(),
+                op: String::new(),
+                key_fp: key_fp.clone(),
+                host: String::new(),
+                peer,
+                decision: if allowed { "allow" } else { "deny" },
+                basis,
+                ui: outcome.ui.to_string(),
+                askpass_reached: outcome.reached,
+                trigger_cmd: trigger,
+            });
             self.write_audit(&format!(
                 "DEST-CONSTRAINT key={key_fp} constraints={} decision={}",
                 rd.constraints.len(),
@@ -563,13 +794,16 @@ impl Session for HistoryAgent {
                 // Keep a short, host-tagged ring of recent commands for sign
                 // prompt context (display only; never used to authorize).
                 let host_fp = self.session_binding.as_ref().map(|b| b.host_fp.clone());
-                self.recent.push_back(RecentEntry {
-                    at: Instant::now(),
-                    command: contents.clone(),
-                    host_fp,
-                });
-                if self.recent.len() > 20 {
-                    self.recent.pop_front();
+                {
+                    let mut r = self.recent.lock().unwrap();
+                    r.push_back(RecentEntry {
+                        at: Instant::now(),
+                        command: contents.clone(),
+                        host_fp,
+                    });
+                    if r.len() > 20 {
+                        r.pop_front();
+                    }
                 }
                 if self.host_label.is_none() {
                     let label = contents.split_whitespace().next().unwrap_or("").to_string();
@@ -611,7 +845,34 @@ impl Session for HistoryAgent {
                     host_fp: Some(host_fp.clone()),
                     recent: Vec::new(),
                 };
-                let allowed = matches!(request_approval(&req).await, Some(d) if d.allow);
+                let peer = self
+                    .peer
+                    .map(|(p, u)| format!("{p}/{u}"))
+                    .unwrap_or_else(|| "?".to_string());
+                let incoming = req.timestamp;
+                let outcome = request_approval(&req).await;
+                let decided_at = now_secs();
+                let trigger = self.trigger_cmd(Some(&host_fp));
+                let allowed = matches!(&outcome.outcome, ApprovalOutcome::Allow { .. });
+                let basis = match &outcome.outcome {
+                    ApprovalOutcome::Allow { .. } => "askpass-allow".to_string(),
+                    ApprovalOutcome::Deny => "askpass-deny".to_string(),
+                    ApprovalOutcome::Unreachable { reason } => format!("fail-closed:{reason}"),
+                };
+                self.write_auth(&AuthEvent {
+                    ts: incoming,
+                    decided_at,
+                    kind: "session-bind".into(),
+                    op: String::new(),
+                    key_fp: String::new(),
+                    host: host_fp.clone(),
+                    peer,
+                    decision: if allowed { "allow" } else { "deny" },
+                    basis,
+                    ui: outcome.ui.to_string(),
+                    askpass_reached: outcome.reached,
+                    trigger_cmd: trigger,
+                });
                 self.write_audit(&format!(
                     "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision={}",
                     bind.is_forwarding as u8,
@@ -870,6 +1131,56 @@ mod tests {
     }
 
     #[test]
+    fn test_deny_not_sticky_only_accepts_remembered() {
+        // Use an isolated HOME so we don't race with a live agent's policy.json.
+        let tmp_home = std::env::temp_dir().join(format!("boom-sshh-test-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_home);
+        std::env::set_var("HOME", &tmp_home);
+
+        let (f, path) = test_histfile();
+        let agent = HistoryAgent::new(f);
+
+        // A user-accepted rule is remembered and mirrored to the snapshot.
+        agent.policy.lock().unwrap().push(Rule {
+            key_fp: Some("k1".into()),
+            op: Some(Op::SshUserAuth),
+            host_fp: Some(Some("h".into())),
+            action: Action::Allow,
+            expires_at: None,
+            builtin: false,
+        });
+        write_policy_snapshot(&agent.policy);
+        let snap = std::fs::read_to_string(policy_snapshot_path()).unwrap();
+        let rules: Vec<ApprovedRule> = serde_json::from_str(&snap).unwrap();
+        assert_eq!(rules.len(), 1, "user accept should be remembered");
+        assert!(!rules[0].builtin);
+
+        // Built-in defaults are never mirrored into the user snapshot.
+        let snapshot_non_builtin: usize = agent
+            .policy
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| !r.builtin)
+            .count();
+        assert_eq!(snapshot_non_builtin, 1, "only the user accept is remembered");
+
+        // `policy clear` semantics: drop only non-builtin rules (denies are
+        // never stored, so nothing to drop for them). The 2 seeded defaults
+        // (git commit/tag) remain.
+        agent.policy.lock().unwrap().retain(|r| r.builtin);
+        assert_eq!(agent.policy.lock().unwrap().len(), 2, "built-in defaults survive clear");
+        write_policy_snapshot(&agent.policy);
+        let snap = std::fs::read_to_string(policy_snapshot_path()).unwrap();
+        let rules: Vec<ApprovedRule> = serde_json::from_str(&snap).unwrap();
+        assert!(rules.is_empty(), "after clear, nothing is remembered");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(policy_snapshot_path());
+        let _ = fs::remove_dir_all(&tmp_home);
+    }
+
+    #[test]
     fn test_classify_op() {
         // Git commit object begins with "tree ".
         assert_eq!(
@@ -900,6 +1211,67 @@ mod tests {
         assert_eq!(HistoryAgent::classify_op(&ua), Op::SshUserAuth);
         // Unrecognized content is Unknown (prompts), never silently allowed.
         assert_eq!(HistoryAgent::classify_op(b"hello world"), Op::Unknown);
+    }
+
+    #[test]
+    fn test_auth_log_and_trigger_cmd() {
+        use std::io::Read;
+
+        let (f, hpath) = test_histfile();
+        let dir = std::env::temp_dir().join(format!("boom-sshh-authtest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let apath = dir.join("auth.log");
+        let af = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&apath)
+            .unwrap();
+        let mut agent = HistoryAgent::new(f);
+        agent.set_authfile(af);
+
+        // Seed a recent command and confirm trigger correlation is host-scoped.
+        agent.recent.lock().unwrap().push_back(RecentEntry {
+            at: Instant::now(),
+            command: "ssh user@host".to_string(),
+            host_fp: Some("h".to_string()),
+        });
+        assert_eq!(agent.trigger_cmd(Some(&"h".to_string())), Some("ssh user@host".to_string()));
+        assert_eq!(agent.trigger_cmd(Some(&"other".to_string())), None);
+
+        // A recorded decision should land in the auth log as one JSON line.
+        agent.write_auth(&AuthEvent {
+            ts: 1_700_000_000,
+            decided_at: 1_700_000_005,
+            kind: "sign".into(),
+            op: "ssh-userauth".into(),
+            key_fp: "k1".into(),
+            host: "h".into(),
+            peer: "123/1000".into(),
+            decision: "deny",
+            basis: "fail-closed:no tty and no GUI helper".into(),
+            ui: "none".into(),
+            askpass_reached: false,
+            trigger_cmd: Some("ssh user@host".to_string()),
+        });
+
+        let mut content = String::new();
+        std::fs::File::open(&apath)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let line: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(line["ts"], 1_700_000_000);
+        assert_eq!(line["decision"], "deny");
+        assert_eq!(line["basis"], "fail-closed:no tty and no GUI helper");
+        assert_eq!(line["ui"], "none");
+        assert_eq!(line["askpass_reached"], false);
+        assert_eq!(line["trigger_cmd"], "ssh user@host");
+        assert_eq!(line["kind"], "sign");
+
+        let _ = std::fs::remove_file(&hpath);
+        let _ = std::fs::remove_file(&apath);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -949,6 +1321,7 @@ mod tests {
             host_fp: Some(Some(host.clone())),
             action: Action::Allow,
             expires_at: None,
+            builtin: false,
         });
 
         let ctx_host = SignContext {
@@ -975,6 +1348,7 @@ mod tests {
                 host_fp: None,
                 action: Action::Allow,
                 expires_at: Some(std::time::Instant::now() - Duration::from_secs(1)),
+                builtin: false,
             });
         }
         assert_eq!(agent.evaluate(&ctx_host), Some(Action::Allow)); // still matched by session rule

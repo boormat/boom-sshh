@@ -1,6 +1,6 @@
 [package]
 name = "boom-sshh"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "SSH agent with HISTORY extension for logging remote commands"
 
@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", features = ["crypto"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time", "signal"] }
 async-trait = "0.1"
 env_logger = "0.11"
 log = "0.4"

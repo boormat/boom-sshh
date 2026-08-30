@@ -49,12 +49,34 @@ pub struct ApprovalDecision {
     pub ttl: Option<std::time::Duration>,
 }
 
+/// The result of asking the configured approver.
+///
+/// `Unreachable` means the user was never actually given a choice (no usable UI,
+/// spawn failure, timeout, or non-zero exit) — callers fail closed on it. It is
+/// kept distinct from an explicit `Deny` so the auth log can show *why* a request
+/// was rejected, and so nothing is ever remembered as "denied".
+pub enum ApprovalOutcome {
+    Allow { ttl: Option<std::time::Duration> },
+    Deny,
+    Unreachable { reason: String },
+}
+
+/// Full result returned to the agent: the outcome plus diagnostics describing
+/// how the approver was reached (used only for logging/feedback).
+pub struct AskpassResult {
+    pub outcome: ApprovalOutcome,
+    /// UI path that would/should have been used: `tui` | `gui` | `none` | `auto`.
+    pub ui: &'static str,
+    /// Whether an approver process was actually spawned/contacted.
+    pub reached: bool,
+}
+
 /// Ask the configured approver whether a request should be allowed.
 ///
-/// Returns `Some(decision)` for an explicit decision from a reachable approver,
-/// or `None` when no approver could be reached (spawn failure, timeout, or no
-/// usable UI). Callers fail closed on `None`.
-pub async fn request_approval(req: &ApprovalRequest) -> Option<ApprovalDecision> {
+/// Returns an [`AskpassResult`]: an explicit `Allow`/`Deny` from a reachable
+/// approver, or `Unreachable` (with a reason) when the user was never actually
+/// given a choice. Callers fail closed on `Unreachable`.
+pub async fn request_approval(req: &ApprovalRequest) -> AskpassResult {
     let timeout = std::env::var("BOOM_SSHH_ASKPASS_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -64,15 +86,32 @@ pub async fn request_approval(req: &ApprovalRequest) -> Option<ApprovalDecision>
     // shortcut — it spawns `true`, which prints nothing, so treat it specially.
     if let Ok(p) = std::env::var("BOOM_SSHH_ASKPASS") {
         if p.trim() == "true" {
-            return Some(ApprovalDecision {
-                allow: true,
-                ttl: None,
-            });
+            return AskpassResult {
+                outcome: ApprovalOutcome::Allow { ttl: None },
+                ui: "auto",
+                reached: false,
+            };
         }
     }
 
-    let mut cmd = match std::env::var("BOOM_SSHH_ASKPASS") {
-        Ok(p) if !p.trim().is_empty() => {
+    // Decide which UI path applies *before* spawning, so we can report it even
+    // when no approver is reachable (the common "rejected without a pop-up" case).
+    let ui: &'static str = if tty_usable() {
+        "tui"
+    } else if gui_present() {
+        "gui"
+    } else {
+        "none"
+    };
+
+    // Custom approver: always spawn it (it may notify the user by other means).
+    let custom = match std::env::var("BOOM_SSHH_ASKPASS") {
+        Ok(p) if !p.trim().is_empty() => Some(p),
+        _ => None,
+    };
+
+    let mut cmd = match &custom {
+        Some(p) => {
             let mut parts = p.split_whitespace();
             let mut c = Command::new(parts.next().unwrap());
             for a in parts {
@@ -80,19 +119,48 @@ pub async fn request_approval(req: &ApprovalRequest) -> Option<ApprovalDecision>
             }
             c
         }
-        _ => match std::env::current_exe() {
-            Ok(exe) => {
-                let mut c = Command::new(exe);
-                c.arg("askpass");
-                c
+        None => {
+            // Default approver: if there is no usable UI at all, don't even
+            // bother spawning — report it as unreachable for clear diagnostics.
+            if ui == "none" {
+                return AskpassResult {
+                    outcome: ApprovalOutcome::Unreachable {
+                        reason: "no tty and no GUI helper".into(),
+                    },
+                    ui,
+                    reached: false,
+                };
             }
-            Err(_) => return None,
-        },
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let mut c = Command::new(exe);
+                    c.arg("askpass");
+                    c
+                }
+                Err(_) => {
+                    return AskpassResult {
+                        outcome: ApprovalOutcome::Unreachable {
+                            reason: "agent exe not found".into(),
+                        },
+                        ui,
+                        reached: false,
+                    }
+                }
+            }
+        }
     };
 
     let json = match serde_json::to_string(req) {
         Ok(j) => j,
-        Err(_) => return None,
+        Err(_) => {
+            return AskpassResult {
+                outcome: ApprovalOutcome::Unreachable {
+                    reason: "request serialization failed".into(),
+                },
+                ui,
+                reached: false,
+            }
+        }
     };
 
     cmd.stdin(std::process::Stdio::piped())
@@ -101,16 +169,38 @@ pub async fn request_approval(req: &ApprovalRequest) -> Option<ApprovalDecision>
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return None,
+        Err(_) => {
+            return AskpassResult {
+                outcome: ApprovalOutcome::Unreachable {
+                    reason: "approver spawn failed".into(),
+                },
+                ui,
+                reached: false,
+            }
+        }
     };
 
     {
         let mut stdin = match child.stdin.take() {
             Some(s) => s,
-            None => return None,
+            None => {
+                return AskpassResult {
+                    outcome: ApprovalOutcome::Unreachable {
+                        reason: "approver stdin unavailable".into(),
+                    },
+                    ui,
+                    reached: false,
+                }
+            }
         };
         if stdin.write_all(json.as_bytes()).await.is_err() {
-            return None;
+            return AskpassResult {
+                outcome: ApprovalOutcome::Unreachable {
+                    reason: "approver stdin write failed".into(),
+                },
+                ui,
+                reached: false,
+            };
         }
         let _ = stdin.shutdown().await;
         drop(stdin);
@@ -122,8 +212,46 @@ pub async fn request_approval(req: &ApprovalRequest) -> Option<ApprovalDecision>
     )
     .await
     {
-        Ok(Ok(out)) if out.status.success() => parse_approval_response(&out.stdout),
-        _ => None,
+        Ok(Ok(out)) if out.status.success() => match parse_approval_response(&out.stdout) {
+            Some(d) if d.allow => AskpassResult {
+                outcome: ApprovalOutcome::Allow { ttl: d.ttl },
+                ui,
+                reached: true,
+            },
+            Some(_) => AskpassResult {
+                outcome: ApprovalOutcome::Deny,
+                ui,
+                reached: true,
+            },
+            None => AskpassResult {
+                outcome: ApprovalOutcome::Unreachable {
+                    reason: "unparseable approver output".into(),
+                },
+                ui,
+                reached: true,
+            },
+        },
+        Ok(Ok(_)) => AskpassResult {
+            outcome: ApprovalOutcome::Unreachable {
+                reason: "approver exited non-zero".into(),
+            },
+            ui,
+            reached: true,
+        },
+        Ok(Err(_)) => AskpassResult {
+            outcome: ApprovalOutcome::Unreachable {
+                reason: "approver io error".into(),
+            },
+            ui,
+            reached: true,
+        },
+        Err(_) => AskpassResult {
+            outcome: ApprovalOutcome::Unreachable {
+                reason: "timeout".into(),
+            },
+            ui,
+            reached: true,
+        },
     }
 }
 
@@ -693,6 +821,11 @@ fn command_present(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// True when a native GUI approver helper is available (zenity/kdialog/osascript).
+fn gui_present() -> bool {
+    command_present("zenity") || command_present("kdialog") || command_present("osascript")
 }
 
 /// Centre a rectangle inside `area` at the given percentage of its size.
