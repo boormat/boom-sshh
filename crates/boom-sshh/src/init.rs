@@ -139,14 +139,29 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
         std::process::exit(1);
     }
 
-    if info.client_installed {
-        println!("boom-sshend: already installed");
+    // init always copies (overwrites) boom-sshend to the remote, so reflect that
+    // in both real and dry-run output.
+    if dry_run {
+        if info.client_installed {
+            println!("boom-sshend: would copy to remote (overwriting existing)");
+        } else {
+            println!("boom-sshend: would copy to remote (new)");
+        }
+    } else if info.client_installed {
+        println!("boom-sshend: already installed (will be overwritten)");
     } else {
         println!("boom-sshend: not installed");
     }
 
     for (path, _) in &configs {
-        println!("{path}: will inject trap");
+        let already = std::fs::read_to_string(path)
+            .map(|c| c.contains(CONFIG_SENTINEL))
+            .unwrap_or(false);
+        if dry_run {
+            println!("{path}: would {}", if already { "update trap" } else { "inject trap" });
+        } else {
+            println!("{path}: {}", if already { "already configured" } else { "will inject trap" });
+        }
     }
 
     if dry_run {
@@ -345,13 +360,17 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Pre-flight conflict checks ──
     let mut warnings: Vec<String> = Vec::new();
-    let agent_running = check_boom_sshh_running() || check_ssh_auth_sock_valid();
+    let boom_running = check_boom_sshh_running();
+    let ssh_auth_valid = check_ssh_auth_sock_valid();
 
-    if agent_running {
-        warnings.push("replacing existing agent with direct startup".into());
+    if boom_running {
+        warnings.push("boom-sshh agent already running — startup trap will reuse it".into());
+    }
+    if ssh_auth_valid && !boom_running {
+        warnings.push("ssh-agent detected — boom-sshh will take over as the agent".into());
     }
     if check_ssh_agent_running() {
-        warnings.push("ssh-agent is already running — will be replaced".into());
+        warnings.push("ssh-agent is already running — will be replaced by boom-sshh".into());
     }
     if config_path.exists() {
         let contents = fs::read_to_string(&config_path).unwrap_or_default();
@@ -382,7 +401,18 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     if dry_run {
         println!("approval UI: {ui_desc} (would confirm with user)");
-        println!("agent:       will install + add trap with startup guard");
+        let install_dir = preferred_install_dir();
+        let agent_dest = install_dir.join("boom-sshh");
+        let identical = std::env::current_exe()
+            .map_or(false, |c| agent_dest.exists() && files_identical(&c, &agent_dest));
+        if identical {
+            println!("agent:       {agent_dest:?} (up to date — no change)");
+        } else {
+            let verb = if agent_dest.exists() { "replace" } else { "install" };
+            println!("agent:       would {verb} {agent_dest:?}");
+        }
+        println!("client:      would install boom-sshend to {install_dir:?}");
+        println!("config:      would inject trap into {config_display}");
         println!();
         println!("(dry run — no changes made)");
         return Ok(());
@@ -549,7 +579,39 @@ fn install_local_client() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(install_dir)
 }
 
+/// If `boom-sshh` is already on PATH, return its directory so a reinstall
+/// upgrades that binary in place (rather than dropping a second copy into a
+/// different dir and leaving the old one first on PATH).
+fn detect_existing_install_dir() -> Option<PathBuf> {
+    let out = Command::new("sh")
+        .args(["-c", "command -v boom-sshh"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let p = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if p.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&p);
+    path.is_file().then(|| path.parent().map(|parent| parent.to_path_buf())).flatten()
+}
+
 fn preferred_install_dir() -> PathBuf {
+    // Prefer an already-installed location so reinstalls replace the binary in
+    // the place it's actually found on PATH.
+    if let Some(d) = detect_existing_install_dir() {
+        return d;
+    }
+    // Fall back to the running exe's own */bin dir if applicable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if parent.file_name().map_or(false, |n| n == "bin") {
+                return parent.to_path_buf();
+            }
+        }
+    }
     if fs::write("/usr/local/bin/.boom-sshh-write-test", b"").is_ok() {
         let _ = fs::remove_file("/usr/local/bin/.boom-sshh-write-test");
         PathBuf::from("/usr/local/bin")
@@ -559,23 +621,49 @@ fn preferred_install_dir() -> PathBuf {
     }
 }
 
-/// Copy the current boom-sshh binary to the install directory if not already there.
+/// Copy the current boom-sshh binary to the install directory, overwriting any
+/// existing binary that differs. We compare *contents*, not just the path: if the
+/// running binary is the destination but a different build, it must be replaced.
 fn install_agent_binary(install_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let dest = install_dir.join("boom-sshh");
-
-    // Check if already in the right place
-    if let Ok(current) = std::env::current_exe() {
-        if current == dest {
-            println!("  boom-sshh      {dest:?} (up to date)");
+    let current = match std::env::current_exe() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  boom-sshh      (skipped: cannot locate current executable: {e})");
             return Ok(());
         }
-        // Copy current binary to install dir
-        fs::copy(&current, &dest)?;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
-        println!("  boom-sshh      {dest:?}");
+    };
+
+    let identical = dest.exists() && files_identical(&current, &dest);
+    if identical {
+        println!("  boom-sshh      {dest:?} (up to date)");
+        return Ok(());
     }
 
+    let replacing = dest.exists();
+    fs::copy(&current, &dest)?;
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+    if replacing {
+        println!("  boom-sshh      {dest:?} (replaced)");
+    } else {
+        println!("  boom-sshh      {dest:?}");
+    }
     Ok(())
+}
+
+/// True when two files exist with identical size and bytes.
+fn files_identical(a: &Path, b: &Path) -> bool {
+    let (a_len, b_len) = match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => (x.len(), y.len()),
+        _ => return false,
+    };
+    if a_len != b_len {
+        return false;
+    }
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 // ── local detection ─────────────────────────────────────────────
@@ -729,4 +817,44 @@ fn dirs_or_default() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_install_agent_binary_replaces_when_different() {
+        let dir = std::env::temp_dir().join(format!("bshh-install-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("boom-sshh");
+
+        // A pre-existing, different binary must be overwritten.
+        std::fs::write(&dest, b"OLD-BINARY-CONTENT").unwrap();
+        install_agent_binary(&dir).unwrap();
+        let after = std::fs::read(&dest).unwrap();
+        assert_ne!(after, b"OLD-BINARY-CONTENT", "binary should have been replaced");
+        assert!(
+            files_identical(&std::env::current_exe().unwrap(), &dest),
+            "dest should now match the running executable"
+        );
+
+        // A second run with identical content must be a no-op (up to date),
+        // not a second copy.
+        install_agent_binary(&dir).unwrap();
+        assert!(files_identical(&std::env::current_exe().unwrap(), &dest));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_preferred_install_dir_reuses_exes_bin() {
+        // If the running exe lives in a */bin dir, reinstalls stay in place.
+        let exe = std::env::current_exe().unwrap();
+        if let Some(parent) = exe.parent() {
+            if parent.file_name().map_or(false, |n| n == "bin") {
+                assert_eq!(preferred_install_dir(), parent, "should reuse the exe's bin dir");
+            }
+        }
+    }
 }
