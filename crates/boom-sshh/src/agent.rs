@@ -21,7 +21,9 @@ use ssh_key::public::KeyData;
 use ssh_key::{HashAlg, PrivateKey, PublicKey, Signature};
 use tokio::net::UnixListener;
 
-use crate::approval::{request_approval, ApprovalOutcome, ApprovalRequest};
+use crate::approval::{
+    request_approval, ApprovalOutcome, ApprovalRequest, AllowCriteria, HostSpec,
+};
 
 #[derive(Clone)]
 struct StoredKey {
@@ -63,6 +65,16 @@ impl Op {
             Op::GitTag => "git-tag",
             Op::SshUserAuth => "ssh-userauth",
             Op::Unknown => "unknown",
+        }
+    }
+
+    /// Parse an operation-class string; unrecognised values map to `Unknown`.
+    fn from_str(s: &str) -> Op {
+        match s {
+            "git-commit" => Op::GitCommit,
+            "git-tag" => Op::GitTag,
+            "ssh-userauth" => Op::SshUserAuth,
+            _ => Op::Unknown,
         }
     }
 }
@@ -452,6 +464,7 @@ pub fn write_policy_snapshot(policy: &Arc<Mutex<Vec<Rule>>>) {
         .iter()
         .filter(|r| !r.builtin)
         .map(|r| {
+            let key = r.key_fp.clone().unwrap_or_else(|| "any".to_string());
             let op = r.op.map(|o| o.as_str()).unwrap_or("any").to_string();
             let host = match &r.host_fp {
                 Some(Some(h)) => h.clone(),
@@ -462,8 +475,8 @@ pub fn write_policy_snapshot(policy: &Arc<Mutex<Vec<Rule>>>) {
                 .expires_at
                 .map(|e| e.saturating_duration_since(Instant::now()).as_secs());
             ApprovedRule {
-                id: rule_id(&r.key_fp.clone().unwrap_or_default(), &op, &host),
-                key_fp: r.key_fp.clone().unwrap_or_default(),
+                id: rule_id(&key, &op, &host),
+                key_fp: key,
                 op,
                 host,
                 expires_in_secs,
@@ -635,11 +648,25 @@ impl Session for HistoryAgent {
                 let decided_at = now_iso();
                 let trigger = self.trigger_cmd();
                 let (allow, basis) = match &outcome.outcome {
-                    ApprovalOutcome::Allow { ttl } => {
-                        let rule = Rule {
+                    ApprovalOutcome::Allow { ttl, criteria } => {
+                        // A stored rule matches what the user chose: the edited
+                        // criteria, or (if none) this request's own key/op/host.
+                        let c = criteria.clone().unwrap_or(AllowCriteria {
                             key_fp: Some(ctx.key_fp.clone()),
-                            op: Some(ctx.op),
-                            host_fp: Some(ctx.host_fp.clone()),
+                            op: Some(ctx.op.as_str().to_string()),
+                            host: match &ctx.host_fp {
+                                Some(fp) => HostSpec::Specific(fp.clone()),
+                                None => HostSpec::Unbound,
+                            },
+                        });
+                        let rule = Rule {
+                            key_fp: c.key_fp,
+                            op: c.op.map(|s| Op::from_str(&s)),
+                            host_fp: match c.host {
+                                HostSpec::Any => None,
+                                HostSpec::Unbound => Some(None),
+                                HostSpec::Specific(fp) => Some(Some(fp)),
+                            },
                             action: Action::Allow,
                             expires_at: ttl.map(|t| Instant::now() + t),
                             builtin: false,
@@ -648,6 +675,7 @@ impl Session for HistoryAgent {
                         write_policy_snapshot(&self.policy);
                         (true, "askpass-allow".to_string())
                     }
+                    ApprovalOutcome::AllowOnce => (true, "askpass-once".to_string()),
                     ApprovalOutcome::Deny => (false, "askpass-deny".to_string()),
                     ApprovalOutcome::Unreachable { reason } => {
                         (false, format!("fail-closed:{reason}"))
@@ -801,9 +829,13 @@ impl Session for HistoryAgent {
             let outcome = request_approval(&req).await;
             let decided_at = now_iso();
             let trigger = self.trigger_cmd();
-            let allowed = matches!(&outcome.outcome, ApprovalOutcome::Allow { .. });
+            let allowed = matches!(
+                &outcome.outcome,
+                ApprovalOutcome::Allow { .. } | ApprovalOutcome::AllowOnce
+            );
             let basis = match &outcome.outcome {
                 ApprovalOutcome::Allow { .. } => "askpass-allow".to_string(),
+                ApprovalOutcome::AllowOnce => "askpass-once".to_string(),
                 ApprovalOutcome::Deny => "askpass-deny".to_string(),
                 ApprovalOutcome::Unreachable { reason } => format!("fail-closed:{reason}"),
             };

@@ -86,27 +86,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("boom-sshh test-approval — test the approval UI");
                 println!();
                 println!("Usage:");
-                println!("  boom-sshh test-approval              Auto-detect (TUI or GUI)");
-                println!("  boom-sshh test-approval --force-tui  Force TUI panel");
-                println!("  boom-sshh test-approval --force-gui  Force GUI dialog");
+                println!("  boom-sshh test-approval");
                 return Ok(());
             }
             for arg in &args[2..] {
-                if arg.starts_with('-') && arg != "--force-tui" && arg != "--force-gui" {
+                if arg.starts_with('-') {
                     eprintln!("error: unknown flag '{arg}'");
                     eprintln!();
-                    eprintln!("usage: boom-sshh test-approval [--force-tui | --force-gui]");
+                    eprintln!("usage: boom-sshh test-approval");
                     std::process::exit(1);
                 }
             }
-            let force_ui = if args[2..].iter().any(|a| a == "--force-tui") {
-                Some("tui")
-            } else if args[2..].iter().any(|a| a == "--force-gui") {
-                Some("gui")
-            } else {
-                None
-            };
-            match approval::run_approval_test(force_ui) {
+            match approval::run_approval_test() {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     eprintln!("boom-sshh test-approval: {e}");
@@ -139,9 +130,7 @@ fn print_help() {
     println!("  boom-sshh init --dry-run <host>              Preview remote init");
     println!("  boom-sshh init-agent                         Init local machine");
     println!("  boom-sshh init-agent --dry-run               Preview local init");
-    println!("  boom-sshh test-approval                      Test approval UI");
-    println!("  boom-sshh test-approval --force-tui          Force TUI panel");
-    println!("  boom-sshh test-approval --force-gui          Force GUI dialog");
+    println!("  boom-sshh test-approval                      Test approval UI (GUI)");
     println!("  boom-sshh policy list                        Show remembered accepts");
     println!("  boom-sshh policy clear                       Forget remembered accepts");
     println!("  boom-sshh askpass                            Prompt for approval (stdin)");
@@ -172,7 +161,7 @@ fn print_help() {
     println!("  boom-sshh init -p 2222 user@remote-host");
     println!("  boom-sshh init --dry-run user@remote-host");
     println!("  boom-sshh init-agent");
-    println!("  boom-sshh test-approval --force-gui");
+    println!("  boom-sshh test-approval");
 }
 
 fn print_init_help() {
@@ -209,7 +198,7 @@ fn print_init_agent_help() {
     println!();
     println!("The GUI confirm dialog needs a display. Over an SSH session with no X");
     println!("forwarding it can't show, so use --yes (the dialog can be skipped).");
-    println!("A GUI helper (zenity/kdialog/osascript) is still used for live approval");
+    println!("A GUI helper (zenity/kdialog) is still used for live approval");
     println!("prompts; if those can't display either, requests fail closed.");
 }
 

@@ -417,7 +417,7 @@ pub fn run_init_agent(dry_run: bool, assume_yes: bool) -> Result<(), Box<dyn std
     // it with --yes (e.g. when the dialog can't be reached / Wayland quirks).
     if !assume_yes {
         if ui_desc == "(none)" {
-            eprintln!("error: no GUI helper found (zenity, kdialog, or osascript)");
+            eprintln!("error: no GUI helper found (zenity or kdialog)");
             eprintln!("       install one of these, or pass --yes to install without the");
             eprintln!("       confirmation dialog (see `boom-sshh help` for manual steps).");
             std::process::exit(1);

@@ -53,9 +53,7 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 | `boom-sshh init --dry-run <host>` | Preview remote init |
 | `boom-sshh init-agent` | Init local machine |
 | `boom-sshh init-agent --dry-run` | Preview local init |
-| `boom-sshh test-approval` | Test approval UI |
-| `boom-sshh test-approval --force-tui` | Force TUI panel |
-| `boom-sshh test-approval --force-gui` | Force GUI dialog |
+| `boom-sshh test-approval` | Test approval UI (GUI) |
 | `boom-sshh askpass` | Prompt for approval (stdin) |
 | `boom-sshh list-clients` | List embedded client architectures |
 | `boom-sshh extract-client <arch> <path>` | Extract client binary |
@@ -78,7 +76,7 @@ boom-sshh init --dry-run user@remote-host
 Sets up the local machine:
 - Installs boom-sshh agent and boom-sshend client
 - Starts agent and adds history trap to your shell config
-- Detects the available approval UI (zenity, kdialog, or osascript)
+- Detects the available approval UI (zenity, kdialog)
 - Confirms setup via GUI dialog before proceeding
 - Checks for existing agent and warns if detected
 
@@ -94,12 +92,10 @@ Pre-flight checks before modifying rc files:
 
 ## `test-approval`
 
-Tests the approval UI without setting up the full agent. Useful for verifying that the TUI panel or GUI dialog works on your system.
+Tests the approval UI without setting up the full agent. Useful for verifying that the GUI dialog works on your system.
 
 ```bash
-boom-sshh test-approval              # auto-detect (TUI or GUI)
-boom-sshh test-approval --force-tui  # force TUI panel on /dev/tty
-boom-sshh test-approval --force-gui  # force GUI dialog (zenity/kdialog)
+boom-sshh test-approval   # show the approval dialog (zenity/kdialog)
 ```
 
 ## Configuration
@@ -107,7 +103,7 @@ boom-sshh test-approval --force-gui  # force GUI dialog (zenity/kdialog)
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_HISTFILE` | `~/.boom-sshh/history.log` | Path to the history log file (JSONL) |
-| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for sign prompts (`session-bind` is auto-recorded, never prompted). Executes the given command; prints `allow`, `allow 5m` / `allow 1h` / `allow 12h` / `allow session`, or `deny` to stdout. |
+| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for sign prompts (`session-bind` is auto-recorded, never prompted). It reads a JSON request on stdin and prints a JSON envelope (`{"decision":"allow","ttl":"5m","criteria":{…}}`, `{"decision":"once"}`, `{"decision":"deny"}`); legacy tokens (`allow` / `allow 5m` / `allow session` / `deny`) are also accepted. `BOOM_SSHH_ASKPASS=true` = always allow (history-only mode). |
 | `BOOM_SSHH_ASKPASS_TIMEOUT` | `60` | Approver timeout in seconds. |
 
 ```bash
@@ -183,26 +179,33 @@ default; an `ssh-userauth` signature (ssh/scp/ansible/git push-pull) requires an
 explicit, time-bounded approval the first time it is seen.
 
 When no rule matches, the agent prompts via `BOOM_SSHH_ASKPASS` (the default
-`boom-sshh askpass` shows a GUI dialog with zenity/kdialog when available, or a
-TUI panel on `/dev/tty`). The response can carry a duration:
+`boom-sshh askpass` shows a native GUI dialog via zenity/kdialog). Picking a
+storing duration opens a second dialog where the exact rule criteria (key, op,
+host) are shown and editable — `*` = any, `host=unbound` = only unbound signs.
+The response can carry a duration:
 
 | Response            | Meaning                                            |
 |---|---|
-| `allow session`     | Allow, valid until the agent exits (default)      |
+| `allow forever`     | Allow until the agent exits (default)              |
+| `allow once`        | Allow this one request only; nothing is remembered |
 | `allow 5m`          | Allow for 5 minutes                                |
 | `allow 1h`          | Allow for 1 hour                                   |
 | `allow 12h`         | Allow for 12 hours                                 |
 | `deny`              | Deny                                               |
+| `allow 12h`         | Allow for 12 hours                                 |
+| `deny`              | Deny                                               |
 
-The stored rule is keyed on the key fingerprint, operation class
-(`git-commit` / `git-tag` / `ssh-userauth`), and destination host (from
-`session-bind`). So approving `ssh-userauth` to a host for `1h` makes subsequent
-connections to that host in the next hour silent — which is what lets an ansible
-run over many hosts proceed after a single approval.
+The stored rule matches the criteria you confirm — the key fingerprint,
+operation class (`git-commit` / `git-tag` / `ssh-userauth`), and destination
+host (from `session-bind`); any field can be widened to `*`. So approving
+`ssh-userauth` to a host for `1h` makes subsequent connections to that host in
+the next hour silent — which is what lets an ansible run over many hosts
+proceed after a single approval.
 
-If no approver can be reached (e.g. a headless session with no GUI), the request
-**fails closed** (denied) rather than prompting — set `BOOM_SSHH_ASKPASS=true`
-only as a deliberate "always allow" security-off switch.
+If no GUI approver can be reached (e.g. a headless session with no
+zenity/kdialog), the request **fails closed** (denied) rather than prompting —
+set `BOOM_SSHH_ASKPASS=true` only as a deliberate "always allow" security-off
+switch (history-only mode).
 
 Security notes:
 - Policy lives only in the agent process; there is no on-disk policy file to
