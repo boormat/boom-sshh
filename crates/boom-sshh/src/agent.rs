@@ -303,6 +303,29 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Format an epoch timestamp as ISO-8601 UTC (`%Y-%m-%dT%H:%M:%SZ`).
+fn iso_from_secs(secs: u64) -> String {
+    let t: libc::time_t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::gmtime_r(&t, &mut tm);
+    }
+    let mut buf = [0u8; 32];
+    let len = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            b"%Y-%m-%dT%H:%M:%SZ\0".as_ptr() as *const libc::c_char,
+            &tm,
+        )
+    };
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+fn now_iso() -> String {
+    iso_from_secs(now_secs())
+}
+
 /// Split a HISTORY payload (`host user pid cmd...`) into fields, stripping the
 /// leading shell history-number prefix that the bash/zsh traps put on `cmd`.
 fn parse_history_payload(contents: &str) -> (String, String, u32, String) {
@@ -345,10 +368,10 @@ fn parse_history_payload(contents: &str) -> (String, String, u32, String) {
 /// One decision recorded in the auth log (`~/.boom-sshh/auth.log`, JSONL).
 #[derive(Serialize)]
 struct AuthEvent {
-    /// Request arrival time (epoch secs) — before any prompt.
-    ts: u64,
-    /// Time the decision was returned (epoch secs) — after the prompt/timeout.
-    decided_at: u64,
+    /// Request arrival time (ISO-8601 UTC) — before any prompt.
+    ts: String,
+    /// Time the decision was returned (ISO-8601 UTC) — after the prompt/timeout.
+    decided_at: String,
     /// `sign` | `session-bind` | `dest-constraint`.
     kind: String,
     /// Operation class for `sign` (git-commit/git-tag/ssh-userauth/unknown).
@@ -386,7 +409,7 @@ struct AuthEvent {
 /// One command line recorded in the history log (`~/.boom-sshh/history.log`, JSONL).
 #[derive(Serialize)]
 struct HistoryEvent {
-    ts: u64,
+    ts: String,
     host: String,
     user: String,
     pid: u32,
@@ -555,8 +578,8 @@ impl Session for HistoryAgent {
         let decision = match self.evaluate(&ctx) {
             Some(Action::Allow) => {
                 self.write_auth(&AuthEvent {
-                    ts: incoming,
-                    decided_at: incoming,
+                    ts: iso_from_secs(incoming),
+                    decided_at: iso_from_secs(incoming),
                     kind: "sign".into(),
                     op: op.as_str().into(),
                     key_fp: key_fp.clone(),
@@ -577,8 +600,8 @@ impl Session for HistoryAgent {
             }
             Some(Action::Deny) => {
                 self.write_auth(&AuthEvent {
-                    ts: incoming,
-                    decided_at: incoming,
+                    ts: iso_from_secs(incoming),
+                    decided_at: iso_from_secs(incoming),
                     kind: "sign".into(),
                     op: op.as_str().into(),
                     key_fp: key_fp.clone(),
@@ -613,7 +636,7 @@ impl Session for HistoryAgent {
                     recent: recent.clone(),
                 };
                 let outcome = request_approval(&req).await;
-                let decided_at = now_secs();
+                let decided_at = now_iso();
                 let trigger = self.trigger_cmd(host_fp.as_ref());
                 let (allow, basis) = match &outcome.outcome {
                     ApprovalOutcome::Allow { ttl } => {
@@ -635,7 +658,7 @@ impl Session for HistoryAgent {
                     }
                 };
                 self.write_auth(&AuthEvent {
-                    ts: incoming,
+                    ts: iso_from_secs(incoming),
                     decided_at,
                     kind: "sign".into(),
                     op: op.as_str().into(),
@@ -780,7 +803,7 @@ impl Session for HistoryAgent {
                 .unwrap_or_else(|| "?".to_string());
             let incoming = req.timestamp;
             let outcome = request_approval(&req).await;
-            let decided_at = now_secs();
+            let decided_at = now_iso();
             let trigger = self.trigger_cmd(None);
             let allowed = matches!(&outcome.outcome, ApprovalOutcome::Allow { .. });
             let basis = match &outcome.outcome {
@@ -789,7 +812,7 @@ impl Session for HistoryAgent {
                 ApprovalOutcome::Unreachable { reason } => format!("fail-closed:{reason}"),
             };
             self.write_auth(&AuthEvent {
-                ts: incoming,
+                ts: iso_from_secs(incoming),
                 decided_at,
                 kind: "dest-constraint".into(),
                 op: String::new(),
@@ -854,7 +877,7 @@ impl Session for HistoryAgent {
                     last.insert(parent_pid, LastCommand { command: contents.clone(), seen: now });
                 }
 
-                let ts = now_secs();
+                let ts = now_iso();
                 let (host, user, pid, cmd) = parse_history_payload(&contents);
 
                 // Keep a short, host-tagged ring of recent commands for sign
@@ -909,7 +932,7 @@ impl Session for HistoryAgent {
                     .peer
                     .map(|(p, u)| format!("{p}/{u}"))
                     .unwrap_or_else(|| "?".to_string());
-                let incoming = now_secs();
+                let incoming = now_iso();
 
                 // Per PROTOCOL.agent: the agent verifies the signature and checks
                 // consistency (no duplicate session id, no re-binding a connection
@@ -932,7 +955,7 @@ impl Session for HistoryAgent {
                 if let Some(reason) = reason {
                     self.write_auth(&AuthEvent {
                         ts: incoming,
-                        decided_at: now_secs(),
+                        decided_at: now_iso(),
                         kind: "session-bind".into(),
                         op: String::new(),
                         key_fp: String::new(),
@@ -960,7 +983,7 @@ impl Session for HistoryAgent {
                 });
                 self.write_auth(&AuthEvent {
                     ts: incoming,
-                    decided_at: now_secs(),
+                    decided_at: now_iso(),
                     kind: "session-bind".into(),
                     op: String::new(),
                     key_fp: String::new(),
@@ -1360,8 +1383,8 @@ mod tests {
 
         // A recorded decision should land in the auth log as one JSON line.
         agent.write_auth(&AuthEvent {
-            ts: 1_700_000_000,
-            decided_at: 1_700_000_005,
+            ts: iso_from_secs(1_700_000_000),
+            decided_at: iso_from_secs(1_700_000_005),
             kind: "sign".into(),
             op: "ssh-userauth".into(),
             key_fp: "k1".into(),
@@ -1385,7 +1408,7 @@ mod tests {
             .read_to_string(&mut content)
             .unwrap();
         let line: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
-        assert_eq!(line["ts"], 1_700_000_000);
+        assert_eq!(line["ts"], iso_from_secs(1_700_000_000));
         assert_eq!(line["decision"], "deny");
         assert_eq!(line["basis"], "fail-closed:no tty and no GUI helper");
         assert_eq!(line["ui"], "none");
