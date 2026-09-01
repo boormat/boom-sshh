@@ -95,13 +95,13 @@ impl Rule {
     }
 }
 
-/// One recently logged command on this session, tagged with the bound host so
-/// sign prompts can show host-scoped context. Display only — never authorizes.
+/// One recently logged command on this session, used to show *which* command
+/// likely triggered an approval (prompt context + auth-log trigger_cmd).
+/// Display only — never authorizes.
 #[derive(Clone)]
 struct RecentEntry {
     at: Instant,
     command: String,
-    host_fp: Option<String>,
 }
 
 /// Context used to evaluate a sign request against the policy.
@@ -271,19 +271,16 @@ impl HistoryAgent {
         }
     }
 
-    /// Best guess at the shell command that triggered this approval: the most
-    /// recent HISTORY entry (host-matched when a destination is bound).
-    fn trigger_cmd(&self, host_fp: Option<&String>) -> Option<String> {
-        let r = self.recent.lock().unwrap();
-        if r.is_empty() {
-            return None;
-        }
-        let candidates: Vec<&RecentEntry> = match host_fp {
-            Some(h) => r.iter().filter(|e| e.host_fp.as_ref() == Some(h)).collect(),
-            None => r.iter().collect(),
-        };
-        candidates.last().map(|e| e.command.clone())
-    }
+/// Best guess at the shell command that triggered this approval: the most
+/// recent HISTORY entry within the recent window.
+fn trigger_cmd(&self) -> Option<String> {
+    let r = self.recent.lock().unwrap();
+    let now = Instant::now();
+    r.iter()
+        .rev()
+        .find(|e| now.duration_since(e.at) < Duration::from_secs(30))
+        .map(|e| e.command.clone())
+}
 
     fn remove_key(&self, pubkey: &PublicKey) -> bool {
         let mut keys = self.keys.lock().unwrap();
@@ -555,13 +552,12 @@ impl Session for HistoryAgent {
             host_fp: host_fp.clone(),
         };
 
-        // Recent, host-scoped commands for display context (no authorization).
+        // Recent commands for display context (no authorization).
         let recent: Vec<String> = {
             let now = Instant::now();
             let r = self.recent.lock().unwrap();
             let mut v: Vec<String> = r
                 .iter()
-                .filter(|e| host_fp.as_ref().map_or(true, |h| e.host_fp.as_ref() == Some(h)))
                 .filter(|e| now.duration_since(e.at) < Duration::from_secs(30))
                 .map(|e| e.command.clone())
                 .collect();
@@ -594,7 +590,7 @@ impl Session for HistoryAgent {
                     forwarding: None,
                     verified: None,
                     constraints: None,
-                    trigger_cmd: self.trigger_cmd(host_fp.as_ref()),
+                    trigger_cmd: self.trigger_cmd(),
                 });
                 true
             }
@@ -616,7 +612,7 @@ impl Session for HistoryAgent {
                     forwarding: None,
                     verified: None,
                     constraints: None,
-                    trigger_cmd: self.trigger_cmd(host_fp.as_ref()),
+                    trigger_cmd: self.trigger_cmd(),
                 });
                 false
             }
@@ -637,7 +633,7 @@ impl Session for HistoryAgent {
                 };
                 let outcome = request_approval(&req).await;
                 let decided_at = now_iso();
-                let trigger = self.trigger_cmd(host_fp.as_ref());
+                let trigger = self.trigger_cmd();
                 let (allow, basis) = match &outcome.outcome {
                     ApprovalOutcome::Allow { ttl } => {
                         let rule = Rule {
@@ -804,7 +800,7 @@ impl Session for HistoryAgent {
             let incoming = req.timestamp;
             let outcome = request_approval(&req).await;
             let decided_at = now_iso();
-            let trigger = self.trigger_cmd(None);
+            let trigger = self.trigger_cmd();
             let allowed = matches!(&outcome.outcome, ApprovalOutcome::Allow { .. });
             let basis = match &outcome.outcome {
                 ApprovalOutcome::Allow { .. } => "askpass-allow".to_string(),
@@ -880,15 +876,13 @@ impl Session for HistoryAgent {
                 let ts = now_iso();
                 let (host, user, pid, cmd) = parse_history_payload(&contents);
 
-                // Keep a short, host-tagged ring of recent commands for sign
-                // prompt context (display only; never used to authorize).
-                let host_fp = self.session_binding.as_ref().map(|b| b.host_fp.clone());
+                // Keep a short ring of recent commands for sign prompt context and
+                // trigger correlation (display only; never used to authorize).
                 {
                     let mut r = self.recent.lock().unwrap();
                     r.push_back(RecentEntry {
                         at: Instant::now(),
-                        command: contents.clone(),
-                        host_fp,
+                        command: cmd.clone(),
                     });
                     if r.len() > 20 {
                         r.pop_front();
@@ -970,7 +964,7 @@ impl Session for HistoryAgent {
                         verified: Some(verified),
                         bound: None,
                         constraints: None,
-                        trigger_cmd: self.trigger_cmd(Some(&host_fp)),
+                        trigger_cmd: self.trigger_cmd(),
                     });
                     return Err(AgentError::ExtensionFailure);
                 }
@@ -998,7 +992,7 @@ impl Session for HistoryAgent {
                     verified: Some(verified),
                     bound: None,
                     constraints: None,
-                    trigger_cmd: self.trigger_cmd(Some(&host_fp)),
+                    trigger_cmd: self.trigger_cmd(),
                 });
                 Ok(None)
             }
@@ -1372,14 +1366,18 @@ mod tests {
         let mut agent = HistoryAgent::new(f);
         agent.set_authfile(af);
 
-        // Seed a recent command and confirm trigger correlation is host-scoped.
+        // Seed a recent command and confirm trigger correlation picks it up.
         agent.recent.lock().unwrap().push_back(RecentEntry {
             at: Instant::now(),
             command: "ssh user@host".to_string(),
-            host_fp: Some("h".to_string()),
         });
-        assert_eq!(agent.trigger_cmd(Some(&"h".to_string())), Some("ssh user@host".to_string()));
-        assert_eq!(agent.trigger_cmd(Some(&"other".to_string())), None);
+        assert_eq!(agent.trigger_cmd(), Some("ssh user@host".to_string()));
+        // A stale entry (older than the 30s window) is not attributed.
+        agent.recent.lock().unwrap().push_back(RecentEntry {
+            at: Instant::now() - Duration::from_secs(60),
+            command: "old".to_string(),
+        });
+        assert_eq!(agent.trigger_cmd(), Some("ssh user@host".to_string()));
 
         // A recorded decision should land in the auth log as one JSON line.
         agent.write_auth(&AuthEvent {
