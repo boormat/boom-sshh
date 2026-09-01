@@ -159,7 +159,7 @@ fn print_help() {
     println!("Environment variables:");
     println!("  SSH_AUTH_SOCK          Agent socket path (set automatically)");
     println!("  SSH_AGENT_PID          Agent PID (set automatically)");
-    println!("  AGENT_HISTFILE         History file path (default: ~/.history_all)");
+    println!("  AGENT_HISTFILE         History file path (default: ~/.boom-sshh/history.log)");
     println!("  AGENT_AUTHLOG          Auth log path (default: ~/.boom-sshh/auth.log)");
     println!("  TEST_SSH_AUTH_SOCK     Override socket path (for testing)");
     println!("  BOOM_SSHH_ASKPASS      Approver program (default: 'boom-sshh askpass').");
@@ -403,10 +403,18 @@ fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
         fixed_sock.to_string_lossy().into_owned()
     };
 
-    // Determine history file path
+    // Determine history file path (~/.boom-sshh/history.log unless AGENT_HISTFILE set).
     let hist_path = std::env::var("AGENT_HISTFILE").unwrap_or_else(|_| {
-        dirs_or_default().join(".history_all").to_str().unwrap().to_string()
+        dirs_or_default()
+            .join(".boom-sshh")
+            .join("history.log")
+            .to_str()
+            .unwrap()
+            .to_string()
     });
+    if let Some(dir) = std::path::Path::new(&hist_path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
 
     // Open history file
     let histfile = OpenOptions::new()

@@ -257,14 +257,6 @@ impl HistoryAgent {
         }
     }
 
-    fn write_audit(&self, event: &str) {
-        let ts = now_secs();
-        let line = format!("#{ts} {event}\n");
-        if let Ok(mut f) = self.histfile.lock() {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
-
     /// Append one JSON decision record to the separate auth log.
     ///
     /// `ts` is the request arrival time (captured before any prompt), so the
@@ -311,6 +303,45 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Split a HISTORY payload (`host user pid cmd...`) into fields, stripping the
+/// leading shell history-number prefix that the bash/zsh traps put on `cmd`.
+fn parse_history_payload(contents: &str) -> (String, String, u32, String) {
+    let mut it = contents.split_whitespace();
+    let host = it.next().unwrap_or("").to_string();
+    let user = it.next().unwrap_or("").to_string();
+    let pid = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Reconstruct the command from the original string, after the 3rd token.
+    let mut rest = contents;
+    for _ in 0..3 {
+        match rest.find(|c: char| !c.is_whitespace()) {
+            Some(i) => {
+                rest = &rest[i..];
+                match rest.find(char::is_whitespace) {
+                    Some(j) => rest = &rest[j..],
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    let cmd = rest.trim();
+    // Strip a leading shell history number (e.g. "2076  cmd") from bash/zsh.
+    let cmd = match cmd.split_once(char::is_whitespace) {
+        Some((num, rest)) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+            rest.trim_start()
+        }
+        _ => cmd,
+    };
+    (host, user, pid, cmd.to_string())
+}
+
 /// One decision recorded in the auth log (`~/.boom-sshh/auth.log`, JSONL).
 #[derive(Serialize)]
 struct AuthEvent {
@@ -335,6 +366,32 @@ struct AuthEvent {
     askpass_reached: bool,
     /// The history command that probably triggered this request.
     trigger_cmd: Option<String>,
+    /// `sign`: whether the signing connection was session-bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bound: Option<bool>,
+    /// SSH session id (hex) when bound (`sign`, `session-bind`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    /// `session-bind`: whether this was an agent-forwarding connection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forwarding: Option<bool>,
+    /// `session-bind`: whether the host-key signature verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified: Option<bool>,
+    /// `dest-constraint`: number of destination constraints registered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    constraints: Option<usize>,
+}
+
+/// One command line recorded in the history log (`~/.boom-sshh/history.log`, JSONL).
+#[derive(Serialize)]
+struct HistoryEvent {
+    ts: u64,
+    host: String,
+    user: String,
+    pid: u32,
+    cmd: String,
+    session: Option<String>,
 }
 
 /// A remembered accept, mirrored to `~/.boom-sshh/policy.json` for `policy list`.
@@ -458,6 +515,11 @@ impl Session for HistoryAgent {
             .as_ref()
             .map(|b| b.session_id_hex.clone())
             .unwrap_or_default();
+        let session = if session_hex.is_empty() {
+            None
+        } else {
+            Some(session_hex.clone())
+        };
         let host_display = self
             .host_label
             .clone()
@@ -504,6 +566,11 @@ impl Session for HistoryAgent {
                     basis: "policy".into(),
                     ui: "policy".into(),
                     askpass_reached: false,
+                    bound: Some(bound),
+                    session: session.clone(),
+                    forwarding: None,
+                    verified: None,
+                    constraints: None,
                     trigger_cmd: self.trigger_cmd(host_fp.as_ref()),
                 });
                 true
@@ -521,6 +588,11 @@ impl Session for HistoryAgent {
                     basis: "policy".into(),
                     ui: "policy".into(),
                     askpass_reached: false,
+                    bound: Some(bound),
+                    session: session.clone(),
+                    forwarding: None,
+                    verified: None,
+                    constraints: None,
                     trigger_cmd: self.trigger_cmd(host_fp.as_ref()),
                 });
                 false
@@ -574,20 +646,16 @@ impl Session for HistoryAgent {
                     basis,
                     ui: outcome.ui.to_string(),
                     askpass_reached: outcome.reached,
+                    bound: Some(bound),
+                    session: session.clone(),
+                    forwarding: None,
+                    verified: None,
+                    constraints: None,
                     trigger_cmd: trigger,
                 });
                 allow
             }
         };
-
-        self.write_audit(&format!(
-            "SIGN key={key_fp} peer={peer} bound={} op={} host={} session={} decision={}",
-            bound as u8,
-            op.as_str(),
-            host_display,
-            session_hex,
-            if decision { "allow" } else { "deny" }
-        ));
 
         if !decision {
             return Err(AgentError::other(std::io::Error::other(
@@ -732,13 +800,13 @@ impl Session for HistoryAgent {
                 basis,
                 ui: outcome.ui.to_string(),
                 askpass_reached: outcome.reached,
+                constraints: Some(rd.constraints.len()),
+                bound: None,
+                session: None,
+                forwarding: None,
+                verified: None,
                 trigger_cmd: trigger,
             });
-            self.write_audit(&format!(
-                "DEST-CONSTRAINT key={key_fp} constraints={} decision={}",
-                rd.constraints.len(),
-                if allowed { "allow" } else { "deny" }
-            ));
             if !allowed {
                 return Err(AgentError::other(std::io::Error::other(
                     "destination constraint registration rejected",
@@ -787,11 +855,7 @@ impl Session for HistoryAgent {
                 }
 
                 let ts = now_secs();
-                let bind_suffix = match &self.session_binding {
-                    Some(b) => format!(" session={}", b.session_id_hex),
-                    None => String::new(),
-                };
-                let line = format!("#{ts} {contents}{bind_suffix}\n");
+                let (host, user, pid, cmd) = parse_history_payload(&contents);
 
                 // Keep a short, host-tagged ring of recent commands for sign
                 // prompt context (display only; never used to authorize).
@@ -814,10 +878,20 @@ impl Session for HistoryAgent {
                     }
                 }
 
+                let ev = HistoryEvent {
+                    ts,
+                    host,
+                    user,
+                    pid,
+                    cmd,
+                    session: self.session_binding.as_ref().map(|b| b.session_id_hex.clone()),
+                };
+                let line = serde_json::to_string(&ev).map_err(AgentError::other)?;
                 let mut histfile = self.histfile.lock().unwrap();
                 histfile
                     .write_all(line.as_bytes())
                     .map_err(AgentError::other)?;
+                histfile.write_all(b"\n").map_err(AgentError::other)?;
 
                 Ok(None)
             }
@@ -868,12 +942,13 @@ impl Session for HistoryAgent {
                         basis: reason.to_string(),
                         ui: "auto".into(),
                         askpass_reached: false,
+                        session: Some(session_hex.clone()),
+                        forwarding: Some(bind.is_forwarding),
+                        verified: Some(verified),
+                        bound: None,
+                        constraints: None,
                         trigger_cmd: self.trigger_cmd(Some(&host_fp)),
                     });
-                    self.write_audit(&format!(
-                        "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision=deny reason={reason}",
-                        bind.is_forwarding as u8
-                    ));
                     return Err(AgentError::ExtensionFailure);
                 }
 
@@ -895,12 +970,13 @@ impl Session for HistoryAgent {
                     basis: "auto-bound".to_string(),
                     ui: "auto".into(),
                     askpass_reached: false,
+                    session: Some(session_hex.clone()),
+                    forwarding: Some(bind.is_forwarding),
+                    verified: Some(verified),
+                    bound: None,
+                    constraints: None,
                     trigger_cmd: self.trigger_cmd(Some(&host_fp)),
                 });
-                self.write_audit(&format!(
-                    "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision=auto-bound",
-                    bind.is_forwarding as u8
-                ));
                 Ok(None)
             }
             "query" => {
@@ -997,8 +1073,13 @@ mod tests {
             .unwrap()
             .read_to_string(&mut content)
             .unwrap();
-        assert!(content.starts_with("#"));
-        assert!(content.contains("testhost 1000 1234   42  ls -la"));
+        let line = content.lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["host"], "testhost");
+        assert_eq!(v["user"], "1000");
+        assert_eq!(v["pid"], 1234);
+        assert_eq!(v["cmd"], "ls -la");
+        assert!(v["session"].is_null());
         let _ = fs::remove_file(&path);
     }
 
@@ -1036,8 +1117,10 @@ mod tests {
             .unwrap()
             .read_to_string(&mut content)
             .unwrap();
-        assert!(content.contains("echo 'hello world' && ls"));
-        assert!(content.contains("host-1.example.com"));
+        let line = content.lines().next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["cmd"], "echo 'hello world' && ls");
+        assert_eq!(v["host"], "host-1.example.com");
         let _ = fs::remove_file(&path);
     }
 
@@ -1106,7 +1189,17 @@ mod tests {
     #[tokio::test]
     async fn test_session_bind_auto_accept_and_consistency() {
         let (f, path) = test_histfile();
+        let dir = std::env::temp_dir().join(format!("boom-sshh-bindtest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let apath = dir.join("auth.log");
+        let af = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&apath)
+            .unwrap();
         let mut agent = HistoryAgent::new(f);
+        agent.set_authfile(af);
 
         // 1) A valid bind is recorded without any approval prompt.
         let bind = SessionBind::decode(&mut session_bind_bytes().as_slice()).unwrap();
@@ -1130,15 +1223,29 @@ mod tests {
         assert!(agent.extension(ext3).await.is_err());
 
         let mut content = String::new();
-        File::open(&path)
+        std::fs::File::open(&apath)
             .unwrap()
             .read_to_string(&mut content)
             .unwrap();
-        assert!(content.contains("SESSION-BIND"));
-        assert!(content.contains("decision=auto-bound"));
-        assert!(content.contains("reason=duplicate-session"));
-        assert!(content.contains("reason=invalid-signature"));
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        let bases: Vec<&str> = lines.iter().map(|l| l["basis"].as_str().unwrap()).collect();
+        assert!(bases.contains(&"auto-bound"));
+        assert!(bases.contains(&"duplicate-session"));
+        assert!(bases.contains(&"invalid-signature"));
+        // The audit-only details are captured in the auth log.
+        for l in &lines {
+            assert!(l["session"].is_string());
+            assert!(l["forwarding"].is_boolean());
+            assert!(l["verified"].is_boolean());
+            assert_eq!(l["ui"], "auto");
+        }
 
+        let _ = fs::remove_file(&apath);
+        let _ = fs::remove_dir(&dir);
         let _ = fs::remove_file(&path);
     }
 
@@ -1264,6 +1371,11 @@ mod tests {
             basis: "fail-closed:no tty and no GUI helper".into(),
             ui: "none".into(),
             askpass_reached: false,
+            bound: None,
+            session: None,
+            forwarding: None,
+            verified: None,
+            constraints: None,
             trigger_cmd: Some("ssh user@host".to_string()),
         });
 

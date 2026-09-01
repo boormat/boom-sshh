@@ -22,7 +22,7 @@ Set up a remote hosts environment. It installs the boom-sshend binary and config
 boom-sshh init user@remote-host
 ```
 
-Commands are now logged to `~/.history_all` on your local machine.
+Commands are now logged to `~/.boom-sshh/history.log` on your local machine (JSONL).
 
 ## How it works
 
@@ -34,8 +34,8 @@ Commands are now logged to `~/.history_all` on your local machine.
 └──────────┘                         └──────┬───────┘
                                              │
                                       writes to
-                                             ▼
-                                      ~/.history_all
+▼
+                                       ~/.boom-sshh/history.log
 ```
 
 Each history entry is written with a timestamp, hostname, uid, pid, and command:
@@ -106,7 +106,7 @@ boom-sshh test-approval --force-gui  # force GUI dialog (zenity/kdialog)
 
 | Variable | Default | Description |
 |---|---|---|
-| `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
+| `AGENT_HISTFILE` | `~/.boom-sshh/history.log` | Path to the history log file (JSONL) |
 | `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for sign prompts (`session-bind` is auto-recorded, never prompted). Executes the given command; prints `allow`, `allow 5m` / `allow 1h` / `allow 12h` / `allow session`, or `deny` to stdout. |
 | `BOOM_SSHH_ASKPASS_TIMEOUT` | `60` | Approver timeout in seconds. |
 
