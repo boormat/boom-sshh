@@ -49,12 +49,18 @@ pub struct ApprovalDecision {
     pub ttl: Option<std::time::Duration>,
 }
 
+/// Serializes tests that mutate process-global approval env vars
+/// (`BOOM_SSHH_ASKPASS`, `DISPLAY`, …) so they don't clobber each other.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The result of asking the configured approver.
 ///
 /// `Unreachable` means the user was never actually given a choice (no usable UI,
 /// spawn failure, timeout, or non-zero exit) — callers fail closed on it. It is
 /// kept distinct from an explicit `Deny` so the auth log can show *why* a request
 /// was rejected, and so nothing is ever remembered as "denied".
+#[derive(Debug)]
 pub enum ApprovalOutcome {
     Allow { ttl: Option<std::time::Duration> },
     Deny,
@@ -103,6 +109,8 @@ pub async fn request_approval(req: &ApprovalRequest) -> AskpassResult {
     } else {
         "none"
     };
+    let display_present =
+        std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
 
     // Custom approver: always spawn it (it may notify the user by other means).
     let custom = match std::env::var("BOOM_SSHH_ASKPASS") {
@@ -120,12 +128,14 @@ pub async fn request_approval(req: &ApprovalRequest) -> AskpassResult {
             c
         }
         None => {
-            // Default approver: if there is no usable UI at all, don't even
-            // bother spawning — report it as unreachable for clear diagnostics.
-            if ui == "none" {
+            // Default approver: don't spawn if there's clearly no way to show a
+            // prompt. A GUI helper may be installed, but with no display (e.g. an
+            // SSH session without X forwarding) it cannot appear — report that
+            // directly instead of spawning something that will just fail.
+            if ui == "none" || (ui == "gui" && !display_present) {
                 return AskpassResult {
                     outcome: ApprovalOutcome::Unreachable {
-                        reason: "no tty and no GUI helper".into(),
+                        reason: format!("no usable UI to show a prompt ({})", env_context()),
                     },
                     ui,
                     reached: false,
@@ -165,7 +175,7 @@ pub async fn request_approval(req: &ApprovalRequest) -> AskpassResult {
 
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -231,9 +241,13 @@ pub async fn request_approval(req: &ApprovalRequest) -> AskpassResult {
                 reached: true,
             },
         },
-        Ok(Ok(_)) => AskpassResult {
+        Ok(Ok(out)) => AskpassResult {
             outcome: ApprovalOutcome::Unreachable {
-                reason: "approver exited non-zero".into(),
+                reason: format!(
+                    "approver exited non-zero ({}): {}",
+                    env_context(),
+                    stderr_snippet(&out.stderr)
+                ),
             },
             ui,
             reached: true,
@@ -616,7 +630,7 @@ fn prompt_tui(req: &ApprovalRequest) -> ApprovalDecision {
 fn label_to_decision(label: &str) -> ApprovalDecision {
     let mut p = label.split_whitespace();
     match p.next() {
-        Some("allow") => ApprovalDecision {
+        Some(v) if v.eq_ignore_ascii_case("allow") => ApprovalDecision {
             allow: true,
             ttl: parse_duration(p.next().unwrap_or("session")),
         },
@@ -712,28 +726,38 @@ fn zenity_approve(text: &str, timeout: u64, detail_path: &std::path::Path, has_d
             args.push("--extra-button".into());
             args.push("Details".into());
         }
-        match std::process::Command::new("zenity").args(&args).output().ok() {
-            Some(o) if o.status.success() => {
+        match std::process::Command::new("zenity").args(&args).output() {
+            Ok(o) => {
+                // Extra buttons print their label to stdout when clicked; the
+                // exit code varies by zenity version (0 on GTK3, 1 on GTK4), so
+                // the decision comes from the label, not the exit status.
+                // No label printed = Deny (Deny/Deny OK/Cancel, close, timeout).
                 let label = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if label == "Details" {
-                    let _ = std::process::Command::new("zenity")
-                        .args([
-                            "--text-info",
-                            "--title",
-                            "boom-sshh request",
-                            "--width",
-                            "700",
-                            "--height",
-                            "500",
-                            "--filename",
-                        ])
-                        .arg(detail_path)
-                        .status();
-                    continue;
+                if !label.is_empty() {
+                    if label == "Details" {
+                        let _ = std::process::Command::new("zenity")
+                            .args([
+                                "--text-info",
+                                "--title",
+                                "boom-sshh request",
+                                "--width",
+                                "700",
+                                "--height",
+                                "500",
+                                "--filename",
+                            ])
+                            .arg(detail_path)
+                            .status();
+                        continue;
+                    }
+                    return label_to_decision(&label);
                 }
-                return label_to_decision(&label);
+                return ApprovalDecision {
+                    allow: false,
+                    ttl: None,
+                };
             }
-            _ => return ApprovalDecision {
+            Err(_) => return ApprovalDecision {
                 allow: false,
                 ttl: None,
             },
@@ -828,6 +852,35 @@ fn gui_present() -> bool {
     command_present("zenity") || command_present("kdialog") || command_present("osascript")
 }
 
+/// A short description of the environment a failed popup ran in, so the auth log
+/// can explain *why* the prompt never appeared — e.g. an SSH session with no
+/// display forwarded (`ssh-session;no-display`) versus a missing GUI helper.
+fn env_context() -> String {
+    let ssh =
+        std::env::var("SSH_CONNECTION").is_ok() || std::env::var("SSH_TTY").is_ok();
+    let display =
+        std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+    let mut s = String::from(if ssh { "ssh-session" } else { "local" });
+    if display {
+        s.push_str(";display-present");
+    } else {
+        s.push_str(";no-display");
+    }
+    s
+}
+
+/// First non-empty line of the approver's stderr, trimmed and capped, for inclusion
+/// in the failure reason (e.g. "cannot open display:").
+fn stderr_snippet(stderr: &[u8]) -> String {
+    let s = String::from_utf8_lossy(stderr);
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.is_empty() {
+        "no output".to_string()
+    } else {
+        line.chars().take(160).collect()
+    }
+}
+
 /// Centre a rectangle inside `area` at the given percentage of its size.
 fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let width = area.width * percent_x / 100;
@@ -839,5 +892,95 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: ratatui::layout::Rect) ->
         y,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stderr_snippet_first_line() {
+        assert_eq!(stderr_snippet(b""), "no output");
+        assert_eq!(
+            stderr_snippet(b"cannot open display:\n"),
+            "cannot open display:"
+        );
+        // Blank lines are skipped, and the line is capped.
+        assert_eq!(
+            stderr_snippet(b"\n\n  Unable to init server: DISPLAY not set  \n"),
+            "Unable to init server: DISPLAY not set"
+        );
+        let long = format!("x{}y", "a".repeat(200));
+        assert_eq!(stderr_snippet(long.as_bytes()).len(), 160);
+    }
+
+    #[test]
+    fn test_env_context_shape() {
+        // Just ensure it produces a recognised prefix; exact value depends on env.
+        let c = env_context();
+        assert!(c == "local;display-present"
+            || c == "local;no-display"
+            || c == "ssh-session;display-present"
+            || c == "ssh-session;no-display");
+    }
+
+    #[tokio::test]
+    async fn test_approval_detects_ssh_no_display() {
+        // Simulate an SSH session with no forwarded display and confirm the
+        // failure is reported as such rather than a silent deny.
+        let _g = crate::approval::TEST_ENV_LOCK.lock().unwrap();
+        let had_display = std::env::var("DISPLAY").ok();
+        let had_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::set_var("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 54321");
+        std::env::remove_var("BOOM_SSHH_ASKPASS");
+
+        let req = ApprovalRequest {
+            kind: "sign".into(),
+            timestamp: 1,
+            summary: vec![],
+            key_fp: String::new(),
+            op: "ssh-userauth".into(),
+            host_label: None,
+            host_fp: None,
+            recent: vec![],
+        };
+        let res = request_approval(&req).await;
+
+        std::env::remove_var("SSH_CONNECTION");
+        if let Some(d) = had_display {
+            std::env::set_var("DISPLAY", d);
+        }
+        if let Some(w) = had_wayland {
+            std::env::set_var("WAYLAND_DISPLAY", w);
+        }
+
+        match &res.outcome {
+            ApprovalOutcome::Unreachable { reason } => {
+                assert!(reason.contains("ssh-session"), "reason was: {reason}");
+                assert!(reason.contains("no-display"), "reason was: {reason}");
+            }
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_label_to_decision_allow_case_insensitive() {
+        // Zenity extra buttons are labelled with a capital "Allow …"; the verb
+        // must be matched case-insensitively, otherwise every Allow click is
+        // misinterpreted as a Deny.
+        let session = label_to_decision("Allow session");
+        assert!(session.allow);
+        assert_eq!(session.ttl, None);
+
+        let five = label_to_decision("Allow 5m");
+        assert!(five.allow);
+        assert_eq!(five.ttl, Some(std::time::Duration::from_secs(300)));
+
+        // Deny verb, or anything else (incl. empty), stays a Deny.
+        assert!(!label_to_decision("Deny").allow);
+        assert!(!label_to_decision("").allow);
     }
 }

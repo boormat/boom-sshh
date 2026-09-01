@@ -322,7 +322,7 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
 
 // ── init-agent (local) ────────────────────────────────────────
 
-pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_init_agent(dry_run: bool, assume_yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     if dry_run {
         println!("=== DRY RUN — no changes will be made ===");
         println!();
@@ -387,16 +387,11 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── Detect GUI helper — always required for init-agent ──
+    // ── Detect GUI helper (used for display + the confirm dialog) ──
     println!();
     let ui_desc = match crate::approval::detect_gui_helper() {
         Some(desc) => desc,
-        None => {
-            eprintln!("error: no GUI helper found (zenity, kdialog, or osascript)");
-            eprintln!("       install one of these to use boom-sshh's setup dialogs");
-            eprintln!("       for manual install without GUI, see: boom-sshh help");
-            std::process::exit(1);
-        }
+        None => "(none)".to_string(),
     };
 
     if dry_run {
@@ -418,11 +413,23 @@ pub fn run_init_agent(dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("approval UI: {ui_desc}");
-
-    if !crate::approval::confirm_setup_gui() {
-        println!("setup cancelled");
-        return Ok(());
+    // A GUI helper is required for the confirm dialog unless the user bypasses
+    // it with --yes (e.g. when the dialog can't be reached / Wayland quirks).
+    if !assume_yes {
+        if ui_desc == "(none)" {
+            eprintln!("error: no GUI helper found (zenity, kdialog, or osascript)");
+            eprintln!("       install one of these, or pass --yes to install without the");
+            eprintln!("       confirmation dialog (see `boom-sshh help` for manual steps).");
+            std::process::exit(1);
+        }
+        println!("approval UI: {ui_desc}");
+        if !crate::approval::confirm_setup_gui() {
+            println!("setup cancelled (dialog closed or timed out — run again and choose Allow,");
+            println!("            or use `boom-sshh init-agent --yes` to skip the dialog).");
+            return Ok(());
+        }
+    } else {
+        println!("approval UI: skipped (--yes)");
     }
 
     println!();
@@ -573,8 +580,12 @@ fn install_local_client() -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
-    fs::write(&dest, bytes)?;
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+    // Write to a temp file then atomically rename into place, so we never
+    // truncate a boom-sshend that happens to be executing mid-command.
+    let tmp = install_dir.join(format!(".boom-sshend-install-{}.tmp", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+    fs::rename(&tmp, &dest)?;
     println!("  boom-sshend    {dest:?}");
     Ok(install_dir)
 }
@@ -624,6 +635,10 @@ fn preferred_install_dir() -> PathBuf {
 /// Copy the current boom-sshh binary to the install directory, overwriting any
 /// existing binary that differs. We compare *contents*, not just the path: if the
 /// running binary is the destination but a different build, it must be replaced.
+///
+/// The copy is written to a temp file and atomically renamed into place, so it
+/// works even when the destination is the currently *running* agent binary
+/// (directly overwriting an executing file fails with ETXTBSY "Text file busy").
 fn install_agent_binary(install_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let dest = install_dir.join("boom-sshh");
     let current = match std::env::current_exe() {
@@ -641,8 +656,10 @@ fn install_agent_binary(install_dir: &Path) -> Result<(), Box<dyn std::error::Er
     }
 
     let replacing = dest.exists();
-    fs::copy(&current, &dest)?;
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+    let tmp = install_dir.join(format!(".boom-sshh-install-{}.tmp", std::process::id()));
+    fs::copy(&current, &tmp)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+    fs::rename(&tmp, &dest)?;
     if replacing {
         println!("  boom-sshh      {dest:?} (replaced)");
     } else {

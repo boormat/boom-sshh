@@ -1097,6 +1097,7 @@ mod tests {
         let mut agent = HistoryAgent::new(f);
 
         // 1) BOOM_SSHH_ASKPASS=true always allows (security-off workaround).
+        let _g = crate::approval::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("BOOM_SSHH_ASKPASS", "true");
         let bind = SessionBind::decode(&mut session_bind_bytes().as_slice()).unwrap();
         let ext = Extension::new_message(bind).unwrap();

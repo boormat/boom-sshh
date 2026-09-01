@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Reject unknown flags
             for arg in &args[2..] {
-                if arg.starts_with('-') && arg != "--dry-run" && arg != "-d" {
+                if arg.starts_with('-') && arg != "--dry-run" && arg != "-d" && arg != "--yes" && arg != "-y" {
                     eprintln!("error: unknown flag '{arg}'");
                     eprintln!();
                     print_init_agent_help();
@@ -70,7 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let dry_run = args[2..].iter().any(|a| a == "--dry-run" || a == "-d");
-            init::run_init_agent(dry_run)
+            let assume_yes = args[2..].iter().any(|a| a == "--yes" || a == "-y");
+            init::run_init_agent(dry_run, assume_yes)
         }
         Some("agent") => run_agent_daemon(),
         Some("askpass") => match approval::run_askpass() {
@@ -197,13 +198,19 @@ fn print_init_agent_help() {
     println!();
     println!("This command:");
     println!("  1. Detects your shell and config file");
-    println!("  2. Requires a GUI helper (zenity/kdialog/osascript) for confirmation");
-    println!("  3. Asks for confirmation via GUI dialog");
-    println!("  4. Installs boom-sshend locally");
-    println!("  5. Adds agent startup and history trap to your shell config");
-    println!("  6. Tests the approval UI to verify it works");
+    println!("  2. Asks for confirmation via GUI dialog (or pass --yes to skip it)");
+    println!("  3. Installs boom-sshh and boom-sshend locally");
+    println!("  4. Adds agent startup and history trap to your shell config");
     println!();
-    println!("A GUI helper is required. Install zenity, kdialog, or osascript.");
+    println!("Usage:");
+    println!("  boom-sshh init-agent                 Init local machine (GUI confirm)");
+    println!("  boom-sshh init-agent --yes            Init without the GUI dialog");
+    println!("  boom-sshh init-agent --dry-run        Preview, make no changes");
+    println!();
+    println!("The GUI confirm dialog needs a display. Over an SSH session with no X");
+    println!("forwarding it can't show, so use --yes (the dialog can be skipped).");
+    println!("A GUI helper (zenity/kdialog/osascript) is still used for live approval");
+    println!("prompts; if those can't display either, requests fail closed.");
 }
 
 fn extract_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
