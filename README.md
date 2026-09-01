@@ -107,7 +107,7 @@ boom-sshh test-approval --force-gui  # force GUI dialog (zenity/kdialog)
 | Variable | Default | Description |
 |---|---|---|
 | `AGENT_HISTFILE` | `~/.history_all` | Path to the history log file |
-| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for session-bind / destination-constraint / sign prompts. Executes the given command; prints `allow`, `allow 5m` / `allow 1h` / `allow 12h` / `allow session`, or `deny` to stdout. |
+| `BOOM_SSHH_ASKPASS` | `boom-sshh askpass` | Approver program for sign prompts (`session-bind` is auto-recorded, never prompted). Executes the given command; prints `allow`, `allow 5m` / `allow 1h` / `allow 12h` / `allow session`, or `deny` to stdout. |
 | `BOOM_SSHH_ASKPASS_TIMEOUT` | `60` | Approver timeout in seconds. |
 
 ```bash

@@ -117,7 +117,9 @@ pub struct HistoryAgent {
     histfile: Arc<Mutex<File>>,
     /// Separate, append-only log of approval decisions (distinct from history).
     authfile: Option<Arc<Mutex<File>>>,
-    /// Set when a `session-bind@openssh.com` is accepted on this connection.
+    /// Set when a `session-bind@openssh.com` is recorded on this connection.
+    /// Per PROTOCOL.agent this is recorded, never user-approved; it supplies
+    /// the destination host context for sign prompts and host-scoped rules.
     session_binding: Option<SessionBindingInfo>,
     /// PID/UID of the process on the other end of the agent socket.
     peer: Option<(u32, u32)>,
@@ -829,72 +831,81 @@ impl Session for HistoryAgent {
                 let host_fp = fp_of_keydata(&bind.host_key);
                 let session_hex = hex_encode(&bind.session_id);
 
-                let summary = vec![
-                    format!("host key fingerprint: {host_fp}"),
-                    format!("session id: {session_hex}"),
-                    format!("forwarding: {}", bind.is_forwarding),
-                    format!("signature verified: {verified}"),
-                ];
-                let req = ApprovalRequest {
-                    kind: "session-bind".to_string(),
-                    timestamp: now_secs(),
-                    summary,
-                    key_fp: String::new(),
-                    op: String::new(),
-                    host_label: None,
-                    host_fp: Some(host_fp.clone()),
-                    recent: Vec::new(),
-                };
                 let peer = self
                     .peer
                     .map(|(p, u)| format!("{p}/{u}"))
                     .unwrap_or_else(|| "?".to_string());
-                let incoming = req.timestamp;
-                let outcome = request_approval(&req).await;
-                let decided_at = now_secs();
-                let trigger = self.trigger_cmd(Some(&host_fp));
-                let allowed = matches!(&outcome.outcome, ApprovalOutcome::Allow { .. });
-                let basis = match &outcome.outcome {
-                    ApprovalOutcome::Allow { .. } => "askpass-allow".to_string(),
-                    ApprovalOutcome::Deny => "askpass-deny".to_string(),
-                    ApprovalOutcome::Unreachable { reason } => format!("fail-closed:{reason}"),
+                let incoming = now_secs();
+
+                // Per PROTOCOL.agent: the agent verifies the signature and checks
+                // consistency (no duplicate session id, no re-binding a connection
+                // already bound for authentication), then records the binding. It
+                // is a protocol record, never a user-approval prompt.
+                let reason = if !verified {
+                    Some("invalid-signature")
+                } else if let Some(existing) = &self.session_binding {
+                    if existing.session_id_hex == session_hex {
+                        Some("duplicate-session")
+                    } else if !existing.is_forwarding {
+                        Some("rebind-auth")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 };
+
+                if let Some(reason) = reason {
+                    self.write_auth(&AuthEvent {
+                        ts: incoming,
+                        decided_at: now_secs(),
+                        kind: "session-bind".into(),
+                        op: String::new(),
+                        key_fp: String::new(),
+                        host: host_fp.clone(),
+                        peer,
+                        decision: "deny",
+                        basis: reason.to_string(),
+                        ui: "auto".into(),
+                        askpass_reached: false,
+                        trigger_cmd: self.trigger_cmd(Some(&host_fp)),
+                    });
+                    self.write_audit(&format!(
+                        "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision=deny reason={reason}",
+                        bind.is_forwarding as u8
+                    ));
+                    return Err(AgentError::ExtensionFailure);
+                }
+
+                self.session_binding = Some(SessionBindingInfo {
+                    host_fp: host_fp.clone(),
+                    session_id_hex: session_hex.clone(),
+                    is_forwarding: bind.is_forwarding,
+                    verified,
+                });
                 self.write_auth(&AuthEvent {
                     ts: incoming,
-                    decided_at,
+                    decided_at: now_secs(),
                     kind: "session-bind".into(),
                     op: String::new(),
                     key_fp: String::new(),
                     host: host_fp.clone(),
                     peer,
-                    decision: if allowed { "allow" } else { "deny" },
-                    basis,
-                    ui: outcome.ui.to_string(),
-                    askpass_reached: outcome.reached,
-                    trigger_cmd: trigger,
+                    decision: "allow",
+                    basis: "auto-bound".to_string(),
+                    ui: "auto".into(),
+                    askpass_reached: false,
+                    trigger_cmd: self.trigger_cmd(Some(&host_fp)),
                 });
                 self.write_audit(&format!(
-                    "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision={}",
-                    bind.is_forwarding as u8,
-                    if allowed { "allow" } else { "deny" }
+                    "SESSION-BIND host={host_fp} session={session_hex} forwarding={} verified={verified} decision=auto-bound",
+                    bind.is_forwarding as u8
                 ));
-
-                if allowed {
-                    self.session_binding = Some(SessionBindingInfo {
-                        host_fp,
-                        session_id_hex: session_hex,
-                        is_forwarding: bind.is_forwarding,
-                        verified,
-                    });
-                    Ok(None)
-                } else {
-                    Err(AgentError::ExtensionFailure)
-                }
+                Ok(None)
             }
             "query" => {
                 let supported = vec![
                     "session-bind@openssh.com".to_string(),
-                    "restrict-destination-v00@openssh.com".to_string(),
                     "HISTORY".to_string(),
                     "query".to_string(),
                 ];
@@ -937,7 +948,6 @@ mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
     use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use ssh_agent_lib::ssh_encoding::Decode;
 
@@ -1084,7 +1094,9 @@ mod tests {
             .extensions
             .iter()
             .any(|e| e == "session-bind@openssh.com"));
-        assert!(qr
+        // restrict-destination is intentionally NOT advertised until it is
+        // actually enforced by the agent.
+        assert!(!qr
             .extensions
             .iter()
             .any(|e| e == "restrict-destination-v00@openssh.com"));
@@ -1092,30 +1104,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_bind_approval_modes() {
+    async fn test_session_bind_auto_accept_and_consistency() {
         let (f, path) = test_histfile();
         let mut agent = HistoryAgent::new(f);
 
-        // 1) BOOM_SSHH_ASKPASS=true always allows (security-off workaround).
-        let _g = crate::approval::TEST_ENV_LOCK.lock().unwrap();
-        std::env::set_var("BOOM_SSHH_ASKPASS", "true");
+        // 1) A valid bind is recorded without any approval prompt.
         let bind = SessionBind::decode(&mut session_bind_bytes().as_slice()).unwrap();
         let ext = Extension::new_message(bind).unwrap();
         let result = agent.extension(ext).await.unwrap();
         assert!(result.is_none());
         assert!(agent.session_binding.is_some());
-        std::env::remove_var("BOOM_SSHH_ASKPASS");
 
-        // 2) Explicit deny script must reject the binding.
-        let script = std::env::temp_dir().join(format!("deny-{}.sh", std::process::id()));
-        fs::write(&script, "#!/bin/sh\ncat >/dev/null\nprintf deny\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::env::set_var("BOOM_SSHH_ASKPASS", script.to_str().unwrap());
-
+        // 2) A duplicate session id on the same connection is refused.
         let bind2 = SessionBind::decode(&mut session_bind_bytes().as_slice()).unwrap();
         let ext2 = Extension::new_message(bind2).unwrap();
-        let result2 = agent.extension(ext2).await;
-        assert!(result2.is_err());
+        assert!(agent.extension(ext2).await.is_err());
+
+        // 3) A bind with a corrupted signature is refused (and rejected before
+        //    the duplicate check, since the signature check comes first).
+        let mut bytes = session_bind_bytes();
+        let n = bytes.len();
+        bytes[n - 2] ^= 0xff; // flip the last signature byte; is_forwarding stays 0
+        let bind3 = SessionBind::decode(&mut bytes.as_slice()).unwrap();
+        let ext3 = Extension::new_message(bind3).unwrap();
+        assert!(agent.extension(ext3).await.is_err());
 
         let mut content = String::new();
         File::open(&path)
@@ -1123,12 +1135,11 @@ mod tests {
             .read_to_string(&mut content)
             .unwrap();
         assert!(content.contains("SESSION-BIND"));
-        assert!(content.contains("decision=allow"));
-        assert!(content.contains("decision=deny"));
+        assert!(content.contains("decision=auto-bound"));
+        assert!(content.contains("reason=duplicate-session"));
+        assert!(content.contains("reason=invalid-signature"));
 
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(&script);
-        std::env::remove_var("BOOM_SSHH_ASKPASS");
     }
 
     #[test]
