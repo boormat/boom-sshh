@@ -5,6 +5,8 @@
 #   - ssh-userauth prompts once, then is cached for the TTL window (silent)
 #   - git-commit signing (ssh-keygen -Y sign) is auto-allowed by default
 #   - with a denying approver, ssh-userauth is refused but git-commit still works
+#   - `agent --yolo` approves without consulting the approver, and refuses to
+#     start when an agent is already running
 #
 # Usage: bash policy_test.sh
 
@@ -85,12 +87,13 @@ ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 start_agent() {
-    # $1 = approver script path
+    # $1 = approver script path; $2 = extra flags for the agent (optional)
     SOCK="$TMPDIR/agent.sock"
     HISTFILE="$TMPDIR/history"
+    AUTHLOG="$TMPDIR/auth.log"
     export APPROVER_COUNT="$TMPDIR/approver.count"
-    rm -f "$APPROVER_COUNT" "$SOCK"
-    AGENT_OUTPUT=$(BOOM_SSHH_ASKPASS="$1" TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" "$AGENT_BIN" agent 2>/dev/null)
+    rm -f "$APPROVER_COUNT" "$SOCK" "$AUTHLOG"
+    AGENT_OUTPUT=$(BOOM_SSHH_ASKPASS="$1" TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" AGENT_AUTHLOG="$AUTHLOG" "$AGENT_BIN" agent ${2:-} 2>/dev/null)
     eval "$AGENT_OUTPUT"
     AGENT_PID=$SSH_AGENT_PID
     for i in $(seq 1 50); do [[ -S "$SOCK" ]] && break; sleep 0.05; done
@@ -139,6 +142,35 @@ fi
 printf 'tree abcdef0123456789\nauthor A <a@b.c> 0 +0000\n\nmsg\n' > "$TMPDIR/commit2.txt"
 ssh-keygen -Y sign -f "$TMPDIR/test_key.pub" -n git "$TMPDIR/commit2.txt" >/dev/null 2>&1
 [ -f "$TMPDIR/commit2.txt.sig" ] && ok "git commit still allowed under deny policy" || fail "git commit under deny policy"
+kill "$AGENT_PID" 2>/dev/null || true
+
+# ── Test 4: --yolo approves without ever calling the approver ──────
+# The recorder approver is configured but must never be invoked: --yolo
+# short-circuits before the askpass is consulted.
+echo ""
+echo "=== Test 4: --yolo approves everything ==="
+start_agent "$TMPDIR/recorder.sh" --yolo
+if ssh -p "$PORT" -i "$TMPDIR/test_key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes 127.0.0.1 'true' 2>/dev/null; then
+    ok "ssh-userauth allowed under --yolo"
+else
+    fail "ssh-userauth denied under --yolo"
+fi
+[ "$(approver_calls)" = "0" ] && ok "approver never consulted under --yolo" || fail "approver calls (got $(approver_calls), want 0)"
+grep -q '"basis":"yolo"' "$AUTHLOG" && ok "auth log records basis=yolo" || fail "auth log records basis=yolo"
+grep -q '"askpass_reached":false' "$AUTHLOG" && ok "auth log records askpass_reached=false" || fail "auth log records askpass_reached=false"
+kill "$AGENT_PID" 2>/dev/null || true
+
+# ── Test 5: --yolo refuses when an agent is already running ────────
+echo ""
+echo "=== Test 5: --yolo with a running agent fails ==="
+start_agent "$TMPDIR/recorder.sh"
+set +e
+YOLO_OUT=$(BOOM_SSHH_ASKPASS="$TMPDIR/recorder.sh" TEST_SSH_AUTH_SOCK="$SOCK" AGENT_HISTFILE="$HISTFILE" AGENT_AUTHLOG="$AUTHLOG" "$AGENT_BIN" agent --yolo 2>"$TMPDIR/yolo.err")
+YOLO_RC=$?
+set -e
+[ "$YOLO_RC" -ne 0 ] && ok "--yolo against a running agent exits non-zero" || fail "--yolo should exit non-zero (got $YOLO_RC)"
+echo "$YOLO_OUT" | grep -q 'SSH_AUTH_SOCK=' && ok "still prints SSH_AUTH_SOCK for eval" || fail "should still print SSH_AUTH_SOCK"
+grep -q 'already running' "$TMPDIR/yolo.err" && ok "explains the conflict on stderr" || fail "stderr should explain the conflict"
 kill "$AGENT_PID" 2>/dev/null || true
 
 echo ""

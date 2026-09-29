@@ -144,10 +144,14 @@ pub struct HistoryAgent {
     recent: Arc<Mutex<VecDeque<RecentEntry>>>,
     /// Hostname captured from the first HISTORY line of this session.
     host_label: Option<String>,
+    /// `agent --yolo`: approve every request without consulting an approver.
+    always_allow: bool,
 }
 
 impl HistoryAgent {
-    pub fn new(histfile: File) -> Self {
+    /// `always_allow` is the daemon's `--yolo` flag: when set, every sign and
+    /// destination-constraint request is allowed without an approver.
+    pub fn new(histfile: File, always_allow: bool) -> Self {
         // Default policy: git commit/tag signing is allowed without a prompt.
         // It is local (no remote destination) and low risk — equivalent to a
         // stock ssh-agent that holds the key. ssh-userauth signs still require
@@ -174,6 +178,7 @@ impl HistoryAgent {
             policy: Arc::new(Mutex::new(policy)),
             recent: Arc::new(Mutex::new(VecDeque::new())),
             host_label: None,
+            always_allow,
         }
     }
 
@@ -390,9 +395,9 @@ struct AuthEvent {
     peer: String,
     /// `allow` | `deny`.
     decision: &'static str,
-    /// `policy` | `askpass-allow` | `askpass-deny` | `fail-closed:<reason>`.
+    /// `policy` | `askpass-allow` | `askpass-deny` | `yolo` | `fail-closed:<reason>`.
     basis: String,
-    /// `tui` | `gui` | `none` | `policy` | `auto`.
+    /// `tui` | `gui` | `none` | `policy` | `auto` | `yolo`.
     ui: String,
     /// Whether an approver was actually spawned/contacted.
     askpass_reached: bool,
@@ -644,7 +649,7 @@ impl Session for HistoryAgent {
                     host_fp: host_fp.clone(),
                     recent: recent.clone(),
                 };
-                let outcome = request_approval(&req).await;
+                let outcome = request_approval(&req, self.always_allow).await;
                 let decided_at = now_iso();
                 let trigger = self.trigger_cmd();
                 let (allow, basis) = match &outcome.outcome {
@@ -673,7 +678,7 @@ impl Session for HistoryAgent {
                         };
                         self.policy.lock().unwrap().push(rule);
                         write_policy_snapshot(&self.policy);
-                        (true, "askpass-allow".to_string())
+                        (true, if outcome.ui == "yolo" { "yolo".to_string() } else { "askpass-allow".to_string() })
                     }
                     ApprovalOutcome::AllowOnce => (true, "askpass-once".to_string()),
                     ApprovalOutcome::Deny => (false, "askpass-deny".to_string()),
@@ -826,7 +831,7 @@ impl Session for HistoryAgent {
                 .map(|(p, u)| format!("{p}/{u}"))
                 .unwrap_or_else(|| "?".to_string());
             let incoming = req.timestamp;
-            let outcome = request_approval(&req).await;
+            let outcome = request_approval(&req, self.always_allow).await;
             let decided_at = now_iso();
             let trigger = self.trigger_cmd();
             let allowed = matches!(
@@ -834,6 +839,7 @@ impl Session for HistoryAgent {
                 ApprovalOutcome::Allow { .. } | ApprovalOutcome::AllowOnce
             );
             let basis = match &outcome.outcome {
+                ApprovalOutcome::Allow { .. } if outcome.ui == "yolo" => "yolo".to_string(),
                 ApprovalOutcome::Allow { .. } => "askpass-allow".to_string(),
                 ApprovalOutcome::AllowOnce => "askpass-once".to_string(),
                 ApprovalOutcome::Deny => "askpass-deny".to_string(),
@@ -1107,7 +1113,7 @@ mod tests {
     #[tokio::test]
     async fn test_extension_history() {
         let (f, path) = test_histfile();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
 
         let ext = Extension {
             name: "HISTORY".into(),
@@ -1135,7 +1141,7 @@ mod tests {
     #[tokio::test]
     async fn test_extension_unknown() {
         let (f, path) = test_histfile();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
 
         let ext = Extension {
             name: "UNKNOWN".into(),
@@ -1150,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn test_extension_special_chars() {
         let (f, path) = test_histfile();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
 
         let ext = Extension {
             name: "HISTORY".into(),
@@ -1176,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn test_extension_multiple_entries() {
         let (f, path) = test_histfile();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
 
         for i in 0..3 {
             let ext = Extension {
@@ -1202,7 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_identities_empty() {
         let (f, path) = test_histfile();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
 
         let ids = agent.request_identities().await.unwrap();
         assert!(ids.is_empty());
@@ -1212,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_advertises_supported() {
         let (f, path) = test_histfile();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
 
         let ext = Extension {
             name: "query".into(),
@@ -1247,7 +1253,7 @@ mod tests {
             .truncate(true)
             .open(&apath)
             .unwrap();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
         agent.set_authfile(af);
 
         // 1) A valid bind is recorded without any approval prompt.
@@ -1306,7 +1312,7 @@ mod tests {
         std::env::set_var("HOME", &tmp_home);
 
         let (f, path) = test_histfile();
-        let agent = HistoryAgent::new(f);
+        let agent = HistoryAgent::new(f, false);
 
         // A user-accepted rule is remembered and mirrored to the snapshot.
         agent.policy.lock().unwrap().push(Rule {
@@ -1395,7 +1401,7 @@ mod tests {
             .truncate(true)
             .open(&apath)
             .unwrap();
-        let mut agent = HistoryAgent::new(f);
+        let mut agent = HistoryAgent::new(f, false);
         agent.set_authfile(af);
 
         // Seed a recent command and confirm trigger correlation picks it up.
@@ -1454,7 +1460,7 @@ mod tests {
     #[test]
     fn test_policy_default_allows_git_sign() {
         let (f, path) = test_histfile();
-        let agent = HistoryAgent::new(f);
+        let agent = HistoryAgent::new(f, false);
 
         // Git commit/tag signs are allowed by the seeded default rule.
         assert_eq!(
@@ -1488,7 +1494,7 @@ mod tests {
     #[test]
     fn test_policy_specificity_and_ttl() {
         let (f, path) = test_histfile();
-        let agent = HistoryAgent::new(f);
+        let agent = HistoryAgent::new(f, false);
 
         let host = "hostfp".to_string();
         // Allow ssh-userauth to `host` for this session only (no expiry).

@@ -73,7 +73,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let assume_yes = args[2..].iter().any(|a| a == "--yes" || a == "-y");
             init::run_init_agent(dry_run, assume_yes)
         }
-        Some("agent") => run_agent_daemon(),
+        Some("agent") => {
+            if args[2..].iter().any(|a| a == "--help" || a == "-h") {
+                print_agent_help();
+                return Ok(());
+            }
+            for arg in &args[2..] {
+                if arg.starts_with('-') && arg != "--yolo" {
+                    eprintln!("error: unknown flag '{arg}'");
+                    eprintln!();
+                    print_agent_help();
+                    std::process::exit(1);
+                }
+            }
+            let yolo = args[2..].iter().any(|a| a == "--yolo");
+            run_agent_daemon(yolo)
+        }
         Some("askpass") => match approval::run_askpass() {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -126,6 +141,7 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  boom-sshh agent                              Start the agent");
+    println!("  boom-sshh agent --yolo                       Start the agent, approve everything");
     println!("  boom-sshh init <host>                        Init remote host");
     println!("  boom-sshh init --dry-run <host>              Preview remote init");
     println!("  boom-sshh init-agent                         Init local machine");
@@ -162,6 +178,22 @@ fn print_help() {
     println!("  boom-sshh init --dry-run user@remote-host");
     println!("  boom-sshh init-agent");
     println!("  boom-sshh test-approval");
+}
+
+fn print_agent_help() {
+    println!("boom-sshh agent — start the agent daemon");
+    println!();
+    println!("Usage:");
+    println!("  boom-sshh agent                Start (or reuse) the agent");
+    println!("  boom-sshh agent --yolo         Start the agent, approve every request");
+    println!();
+    println!("--yolo disables approval: no approver is spawned and every sign request");
+    println!("is allowed. It takes precedence over BOOM_SSHH_ASKPASS. It cannot apply to");
+    println!("an agent that is already running — that invocation fails with an error and");
+    println!("leaves the existing agent in place (kill its pid to restart with --yolo).");
+    println!();
+    println!("Approval decisions are always written to the auth log; in --yolo mode the");
+    println!("history log is the only record of what was signed.");
 }
 
 fn print_init_help() {
@@ -338,8 +370,29 @@ fn run_policy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Emit the `eval`-able environment of an already-running agent.
+///
+/// The exports always go to stdout: a shell rc that runs
+/// `eval "$(boom-sshh agent --yolo)"` must still end up with a usable socket.
+/// With `yolo` the running agent was not started with the flag, so the refusal
+/// goes to stderr and the exit status is non-zero — the flag is never silently
+/// ignored, but the calling shell keeps working.
+fn reuse_agent(sock: &str, pid: u32, yolo: bool) -> Result<(), Box<dyn std::error::Error>> {
+    println!("SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;");
+    println!("SSH_AGENT_PID={pid}; export SSH_AGENT_PID;");
+    println!("echo Agent pid {pid};");
+    if yolo {
+        eprintln!("error: --yolo has no effect: agent pid {pid} is already running without it");
+        eprintln!("       kill {pid} (or: kill $(cat ~/.boom-sshh/agent.pid)) and start it again");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// Daemonize the agent: fork, parent exits, child runs the listener.
-fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `yolo` (`--yolo`) makes the agent approve every request without an approver.
+fn run_agent_daemon(yolo: bool) -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // Singleton discovery: ensure multiple shells share ONE agent instead of
@@ -360,10 +413,7 @@ fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         if let Ok(pid) = pid_str.parse::<u32>() {
             if std::path::Path::new(&sock).exists() && unsafe { libc::kill(pid as i32, 0) } == 0 {
-                println!("SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;");
-                println!("SSH_AGENT_PID={pid}; export SSH_AGENT_PID;");
-                println!("echo Agent pid {pid};");
-                return Ok(());
+                return reuse_agent(&sock, pid, yolo);
             }
         }
     }
@@ -373,10 +423,7 @@ fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(pid) = pid_s.trim().parse::<u32>() {
             if fixed_sock.exists() && unsafe { libc::kill(pid as i32, 0) } == 0 {
                 let sock = fixed_sock.to_string_lossy().into_owned();
-                println!("SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;");
-                println!("SSH_AGENT_PID={pid}; export SSH_AGENT_PID;");
-                println!("echo Agent pid {pid};");
-                return Ok(());
+                return reuse_agent(&sock, pid, yolo);
             }
         }
     }
@@ -433,6 +480,10 @@ fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // Set socket permissions
     let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
 
+    if yolo {
+        eprintln!("boom-sshh: --yolo — every sign request is approved without an approver");
+    }
+
     // Fork — parent prints env vars and exits, child daemonizes
     let child_pid = unsafe { libc::fork() };
     if child_pid > 0 {
@@ -456,7 +507,7 @@ fn run_agent_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create fresh tokio runtime in child
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_agent_listener(std_listener, histfile, authfile))?;
+    rt.block_on(run_agent_listener(std_listener, histfile, authfile, yolo))?;
 
     Ok(())
 }
@@ -465,11 +516,12 @@ async fn run_agent_listener(
     std_listener: std::os::unix::net::UnixListener,
     histfile: std::fs::File,
     authfile: std::fs::File,
+    yolo: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     std_listener.set_nonblocking(true)?;
     let tokio_listener = tokio::net::UnixListener::from_std(std_listener)?;
 
-    let mut agent = HistoryAgent::new(histfile);
+    let mut agent = HistoryAgent::new(histfile, yolo);
     agent.set_authfile(authfile);
 
     // `boom-sshh policy clear` sends SIGUSR1: drop all user-remembered accepts

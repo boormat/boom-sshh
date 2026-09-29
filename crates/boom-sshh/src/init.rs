@@ -12,8 +12,26 @@ struct RemoteInfo {
     fish_config: bool,
 }
 
+/// Bash version guard for the `PS0` hook — `PS0` requires bash >= 4.4.
+/// Tested by `test_bash_version_guard_selects_ps0`, which runs this exact string.
+const BASH_PS0_GUARD: &str =
+    "[ -n \"${BASH_VERSINFO:-}\" ] && { [ \"${BASH_VERSINFO[0]}\" -gt 4 ] || { [ \"${BASH_VERSINFO[0]}\" -eq 4 ] && [ \"${BASH_VERSINFO[1]}\" -ge 4 ]; }; }";
+
+/// Command-capture hook for bash, preferring `PS0` over a `DEBUG` trap.
+///
+/// Kept on one line so the line-based [`remove_existing_traps`] can match it.
+/// The `>/dev/null 2>&1` inside the substitution is load-bearing: `PS0`'s
+/// substitution output is rendered into the prompt, and `boom-sshend` prints an
+/// error string when it cannot reach the agent.
+fn bash_capture_line() -> String {
+    format!(
+        "if {BASH_PS0_GUARD}; then PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${{PS0:-}}\"; \
+         else trap 'boom-sshend \"$(history 1)\"' DEBUG; fi\n"
+    )
+}
+
 /// Build the shell snippet that starts the agent and sends each command via `boom-sshend`.
-/// boom-sshend auto-detects hostname, uid, pid — trap only passes the command.
+/// boom-sshend auto-detects hostname, uid, pid — the hook only passes the command.
 /// Deduplication is handled by the agent (not the shell).
 fn build_trap_block(shell: &str) -> String {
     let mut block = String::new();
@@ -24,37 +42,50 @@ fn build_trap_block(shell: &str) -> String {
         _ => block.push_str("eval \"$(boom-sshh agent)\"\n"),
     }
 
-    // Trap block — send commands to the agent
+    // Command capture — send commands to the agent
     match shell {
         "fish" => block.push_str(
             "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n",
         ),
         "zsh" => block.push_str("TRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n"),
-        _ => block.push_str("trap 'boom-sshend \"$(history 1)\"' DEBUG\n"),
+        _ => block.push_str(&bash_capture_line()),
     }
     block
 }
 
 /// Remove all existing boom-ssh lines from config contents.
-/// Only needs to handle current format — no backwards compatibility.
+/// Handles both the current PS0 hook and the legacy DEBUG trap.
 fn remove_existing_traps(contents: &str, shell: &str) -> String {
     let mut result = String::new();
+    // Set while inside the fish preexec function, counting nested `if`s, so the
+    // whole function (body and closing `end`s) is removed as one unit.
+    let mut fish_depth: Option<usize> = None;
 
     for line in contents.lines() {
+        if shell == "fish" {
+            if let Some(depth) = fish_depth {
+                let trimmed = line.trim();
+                if trimmed == "end" {
+                    fish_depth = if depth == 0 { None } else { Some(depth - 1) };
+                } else if trimmed.starts_with("if ") {
+                    fish_depth = Some(depth + 1);
+                }
+                continue;
+            }
+        }
         // Skip agent startup line
         if line.contains("boom-sshh agent") && line.contains("eval") {
             continue;
         }
-        // Skip trap lines
-        if line.contains("boom-sshend") && (line.contains("trap") || line.contains("TRAPDEBUG")) {
+        // Skip command-capture lines: DEBUG trap, PS0 hook, zsh TRAPDEBUG.
+        if line.contains("boom-sshend")
+            && (line.contains("trap") || line.contains("TRAPDEBUG") || line.contains("PS0"))
+        {
             continue;
         }
-        // Skip fish function
-        if line.contains("function __boomssh_preexec") {
-            continue;
-        }
-        // Skip fish end (only if it's the end of the preexec function)
-        if shell == "fish" && line.trim() == "end" && result.contains("__boomssh_preexec") {
+        // Start of the fish preexec function.
+        if shell == "fish" && line.contains("function __boomssh_preexec") {
+            fish_depth = Some(0);
             continue;
         }
 
@@ -873,5 +904,100 @@ mod tests {
                 assert_eq!(preferred_install_dir(), parent, "should reuse the exe's bin dir");
             }
         }
+    }
+
+    #[test]
+    fn test_bash_block_prefers_ps0_with_debug_fallback() {
+        let block = build_trap_block("bash");
+
+        assert!(block.contains("BASH_VERSINFO"), "needs a bash version guard:\n{block}");
+        assert!(
+            block.contains("PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${PS0:-}\""),
+            "needs the PS0 hook (appending, with output redirected):\n{block}"
+        );
+        assert!(
+            block.contains("else trap 'boom-sshend \"$(history 1)\"' DEBUG; fi"),
+            "needs the DEBUG fallback for bash < 4.4:\n{block}"
+        );
+        // The hook must not be the sole mechanism, and must stay on one line so
+        // the line-based stripper can remove it.
+        assert_eq!(block.lines().count(), 2, "bash block should be exactly two lines:\n{block}");
+    }
+
+    #[test]
+    fn test_zsh_and_fish_blocks_unchanged() {
+        assert_eq!(
+            build_trap_block("zsh"),
+            "eval \"$(boom-sshh agent)\"\nTRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n"
+        );
+        assert_eq!(
+            build_trap_block("fish"),
+            "eval (boom-sshh agent)\nfunction __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n"
+        );
+    }
+
+    #[test]
+    fn test_bash_version_guard_selects_ps0() {
+        // Run the guard that the generated block embeds: it must pick the PS0
+        // branch on a bash that has PS0 (4.4+) and the trap branch otherwise.
+        let script = format!("if {BASH_PS0_GUARD}; then echo ps0; else echo trap; fi");
+        let out = Command::new("bash").arg("-c").arg(&script).output().unwrap();
+        let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        let ver = Command::new("bash")
+            .arg("-c")
+            .arg("echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}")
+            .output()
+            .unwrap();
+        let ver = String::from_utf8_lossy(&ver.stdout).trim().to_string();
+        let (major, minor) = ver
+            .split_once('.')
+            .map(|(a, b)| (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0)))
+            .unwrap_or((0, 0));
+        let expect = if major > 4 || (major == 4 && minor >= 4) { "ps0" } else { "trap" };
+
+        assert_eq!(picked, expect, "bash {ver} picked the wrong capture branch");
+    }
+
+    #[test]
+    fn test_remove_existing_traps_strips_legacy_and_ps0() {
+        let rc = concat!(
+            "export PATH=$PATH:$HOME/.local/bin\n",
+            "eval \"$(boom-sshh agent)\"\n",
+            "trap 'boom-sshend \"$(history 1)\"' DEBUG\n",
+            "if [ -n \"${BASH_VERSINFO:-}\" ]; then PS0='$(boom-sshend \"$(history 1)\")'\"${PS0:-}\"; fi\n",
+            "alias ll='ls -l'\n",
+        );
+        let cleaned = remove_existing_traps(rc, "bash");
+        assert_eq!(cleaned, "export PATH=$PATH:$HOME/.local/bin\nalias ll='ls -l'\n");
+
+        // Injecting the current block and cleaning again must return the same
+        // file (init-agent removes the old block before appending the new one).
+        let injected = format!("{cleaned}{}", build_trap_block("bash"));
+        assert_eq!(
+            injected.lines().filter(|l| l.contains("boom-sshend")).count(),
+            1,
+            "one hook line per file:\n{injected}"
+        );
+        assert_eq!(
+            remove_existing_traps(&injected, "bash"),
+            cleaned,
+            "re-injection should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_remove_existing_traps_fish_function() {
+        let rc = "eval (boom-sshh agent)\nfunction __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n";
+        assert_eq!(remove_existing_traps(rc, "fish"), "");
+
+        // Same idempotency property as bash: re-injecting leaves nothing behind.
+        let injected = build_trap_block("fish");
+        assert_eq!(
+            injected.lines().filter(|l| l.contains("boom-sshend")).count(),
+            1,
+            "one hook line per file:\n{injected}"
+        );
+        assert_eq!(remove_existing_traps(&injected, "fish"), "");
     }
 }

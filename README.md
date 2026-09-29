@@ -49,6 +49,7 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 | Command | Description |
 |---|---|
 | `boom-sshh agent` | Start the agent |
+| `boom-sshh agent --yolo` | Start the agent and approve every request |
 | `boom-sshh init <host>` | Init remote host |
 | `boom-sshh init --dry-run <host>` | Preview remote init |
 | `boom-sshh init-agent` | Init local machine |
@@ -60,6 +61,30 @@ Each history entry is written with a timestamp, hostname, uid, pid, and command:
 | `boom-sshh help` | Show help |
 | `boom-sshh version` | Show version |
 | `boom-sshend version` | Show client version |
+
+## Always-approve (`--yolo`)
+
+`boom-sshh agent --yolo` starts the agent with approvals switched off: no approver
+is spawned (no GUI, no askpass) and every sign request is allowed. It takes
+precedence over `BOOM_SSHH_ASKPASS`, including one set to a custom program.
+
+```bash
+eval "$(boom-sshh agent --yolo)"
+```
+
+`--yolo` only applies at startup. If an agent is already running, the new
+invocation still prints the existing socket and pid (so `eval` in a fresh shell
+keeps working) but fails with an error on stderr — kill the running agent and
+start it again to change the mode:
+
+```bash
+kill "$(cat ~/.boom-sshh/agent.pid)"
+eval "$(boom-sshh agent --yolo)"
+```
+
+Approval decisions are logged either way; in `--yolo` mode
+`~/.boom-sshh/auth.log` records `basis: "yolo"` and the history log is the only
+record of what was signed.
 
 ## `init` (remote)
 
@@ -113,14 +138,25 @@ AGENT_HISTFILE=~/my-agent-history eval $(boom-sshh agent)
 ## Manual setup
 
 If you prefer not to use `init`, install `boom-sshend` on the remote host and add to the appropriate shell config.
-boom-sshend auto-detects hostname, uid, pid — the trap only passes the command.
+boom-sshend auto-detects hostname, uid, pid — the hook only passes the command.
 
 ### Bash (`~/.bashrc`)
 
+Bash 4.4 and newer use `PS0`, which runs the hook after each command is read and
+avoids the `DEBUG` trap conflicts common in preconfigured bash 5 environments.
+Older bash falls back to the `DEBUG` trap:
+
 ```bash
 eval "$(boom-sshh agent)"
-trap 'boom-sshend "$(history 1)"' DEBUG
+if [ -n "${BASH_VERSINFO:-}" ] && { [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 4 ]; }; }; then PS0='$(boom-sshend "$(history 1)" >/dev/null 2>&1)'"${PS0:-}"; else trap 'boom-sshend "$(history 1)"' DEBUG; fi
 ```
+
+The `>/dev/null 2>&1` matters: `PS0`'s command-substitution output is rendered
+into the prompt, so anything `boom-sshend` prints would appear on the prompt line.
+
+`init` skips a host whose rc file already contains a `boom-sshend` line, so a
+host configured before this change keeps its `DEBUG` trap. To migrate one, delete
+the `boom-sshend` lines from its `~/.bashrc`, then re-run `boom-sshh init <host>`.
 
 ### Zsh (`~/.zshrc`)
 
@@ -178,6 +214,9 @@ to disk; reset when the agent exits). Git commit/tag signing is allowed by
 default; an `ssh-userauth` signature (ssh/scp/ansible/git push-pull) requires an
 explicit, time-bounded approval the first time it is seen.
 
+`boom-sshh agent --yolo` skips all of this: every request is allowed without an
+approver (see [Always-approve](#always-approve---yolo)).
+
 When no rule matches, the agent prompts via `BOOM_SSHH_ASKPASS` (the default
 `boom-sshh askpass` shows a native GUI dialog via zenity/kdialog). Picking a
 storing duration opens a second dialog where the exact rule criteria (key, op,
@@ -204,8 +243,8 @@ proceed after a single approval.
 
 If no GUI approver can be reached (e.g. a headless session with no
 zenity/kdialog), the request **fails closed** (denied) rather than prompting —
-set `BOOM_SSHH_ASKPASS=true` only as a deliberate "always allow" security-off
-switch (history-only mode).
+set `BOOM_SSHH_ASKPASS=true`, or start the agent with `--yolo`, only as a
+deliberate "always allow" security-off switch (history-only mode).
 
 Security notes:
 - Policy lives only in the agent process; there is no on-disk policy file to

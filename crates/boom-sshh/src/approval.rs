@@ -113,10 +113,25 @@ pub struct AskpassResult {
 
 /// Ask the configured approver whether a request should be allowed.
 ///
+/// `always_allow` comes from the agent's `--yolo` flag and short-circuits every
+/// other mechanism, including an explicitly configured `BOOM_SSHH_ASKPASS`.
+///
 /// Returns an [`AskpassResult`]: an explicit `Allow`/`Deny` from a reachable
 /// approver, or `Unreachable` (with a reason) when the user was never actually
 /// given a choice. Callers fail closed on `Unreachable`.
-pub async fn request_approval(req: &ApprovalRequest) -> AskpassResult {
+pub async fn request_approval(req: &ApprovalRequest, always_allow: bool) -> AskpassResult {
+    // `--yolo` bypasses the approver entirely (no process spawned, no UI).
+    if always_allow {
+        return AskpassResult {
+            outcome: ApprovalOutcome::Allow {
+                ttl: None,
+                criteria: None,
+            },
+            ui: "yolo",
+            reached: false,
+        };
+    }
+
     let timeout = std::env::var("BOOM_SSHH_ASKPASS_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -1038,7 +1053,7 @@ mod tests {
             host_fp: None,
             recent: vec![],
         };
-        let res = request_approval(&req).await;
+        let res = request_approval(&req, false).await;
 
         std::env::remove_var("SSH_CONNECTION");
         if let Some(d) = had_display {
