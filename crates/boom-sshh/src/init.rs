@@ -726,6 +726,8 @@ fn install_local_client() -> Result<PathBuf, Box<dyn std::error::Error>> {
     };
 
     let install_dir = preferred_install_dir();
+    // ~/.local/bin need not exist yet on a fresh machine.
+    fs::create_dir_all(&install_dir)?;
     let dest = install_dir.join("boom-sshend");
 
     // Skip if already in place with same content
@@ -798,6 +800,8 @@ fn preferred_install_dir() -> PathBuf {
 /// works even when the destination is the currently *running* agent binary
 /// (directly overwriting an executing file fails with ETXTBSY "Text file busy").
 fn install_agent_binary(install_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Create the destination rather than assuming a previous install made it.
+    fs::create_dir_all(install_dir)?;
     let dest = install_dir.join("boom-sshh");
     let current = match std::env::current_exe() {
         Ok(c) => c,
@@ -1048,6 +1052,21 @@ mod tests {
         assert!(files_identical(&std::env::current_exe().unwrap(), &dest));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_install_agent_binary_creates_missing_install_dir() {
+        // A fresh machine has no ~/.local/bin; the install must create it rather
+        // than failing with a raw NotFound from the first write.
+        let root = std::env::temp_dir().join(format!("bshh-install-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("nested").join("bin");
+        assert!(!dir.exists());
+
+        install_agent_binary(&dir).unwrap();
+        assert!(dir.join("boom-sshh").is_file(), "binary should have been installed");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
