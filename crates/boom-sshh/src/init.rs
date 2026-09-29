@@ -893,9 +893,17 @@ fn detect_remote(
     let arch = ssh_exec(ssh_args, host, "uname -m", control_path)?;
     let arch = arch.trim().to_string();
 
-    let client_installed = ssh_exec(ssh_args, host, "which boom-sshend >/dev/null 2>&1", control_path)
-        .map(|_| true)
-        .unwrap_or(false);
+    // Ask about the path init installs to, not PATH: a non-interactive ssh
+    // session has no ~/.local/bin (interactive rc files add it), so `which`
+    // reports the client missing on hosts where it is installed.
+    let client_installed = ssh_exec(
+        ssh_args,
+        host,
+        "test -x ~/.local/bin/boom-sshend || command -v boom-sshend >/dev/null 2>&1",
+        control_path,
+    )
+    .map(|_| true)
+    .unwrap_or(false);
 
     let bashrc = ssh_exec(ssh_args, host, "test -f ~/.bashrc && echo yes || echo no", control_path)
         .map(|s| s.trim() == "yes")
