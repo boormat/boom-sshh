@@ -10,47 +10,126 @@ struct RemoteInfo {
     bashrc: bool,
     zshrc: bool,
     fish_config: bool,
+    /// `MAJOR.MINOR` from the host's bash, or `None` when it could not be read.
+    bash_version: Option<String>,
 }
 
-/// Bash version guard for the `PS0` hook — `PS0` requires bash >= 4.4.
-/// Tested by `test_bash_version_guard_selects_ps0`, which runs this exact string.
-const BASH_PS0_GUARD: &str =
-    "[ -n \"${BASH_VERSINFO:-}\" ] && { [ \"${BASH_VERSINFO[0]}\" -gt 4 ] || { [ \"${BASH_VERSINFO[0]}\" -eq 4 ] && [ \"${BASH_VERSINFO[1]}\" -ge 4 ]; }; }";
-
-/// Command-capture hook for bash, preferring `PS0` over a `DEBUG` trap.
+/// The command-capture mechanism to write into a shell config.
 ///
-/// Kept on one line so the line-based [`remove_existing_traps`] can match it.
-/// The `>/dev/null 2>&1` inside the substitution is load-bearing: `PS0`'s
-/// substitution output is rendered into the prompt, and `boom-sshend` prints an
-/// error string when it cannot reach the agent.
-fn bash_capture_line() -> String {
-    format!(
-        "if {BASH_PS0_GUARD}; then PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${{PS0:-}}\"; \
-         else trap 'boom-sshend \"$(history 1)\"' DEBUG; fi\n"
-    )
+/// Chosen at init time from the target shell and, for bash, the version of bash
+/// on that host, so the rc file gets one unconditional line instead of testing
+/// `BASH_VERSINFO` on every shell start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Hook {
+    /// bash >= 4.4: `PS0` runs after each command is read.
+    BashPs0,
+    /// Older bash: the `DEBUG` trap, which every bash supports.
+    BashDebugTrap,
+    /// zsh: `TRAPDEBUG`.
+    Zsh,
+    /// fish: `fish_preexec`.
+    Fish,
+}
+
+impl Hook {
+    fn label(self) -> &'static str {
+        match self {
+            Hook::BashPs0 => "bash PS0 (bash >= 4.4)",
+            Hook::BashDebugTrap => "bash DEBUG trap (bash < 4.4 or unknown)",
+            Hook::Zsh => "zsh TRAPDEBUG",
+            Hook::Fish => "fish fish_preexec",
+        }
+    }
+
+    /// Shell whose rc file this hook belongs to. Also selects the stripping
+    /// rules, since the fish block is the only multi-line one.
+    fn shell(self) -> &'static str {
+        match self {
+            Hook::BashPs0 | Hook::BashDebugTrap => "bash",
+            Hook::Zsh => "zsh",
+            Hook::Fish => "fish",
+        }
+    }
+}
+
+/// `PS0` was added in bash 4.4. An unreadable version falls back to the `DEBUG`
+/// trap, which works on every bash.
+fn bash_supports_ps0(version: Option<&str>) -> bool {
+    match version.and_then(parse_major_minor) {
+        Some((major, minor)) => major > 4 || (major == 4 && minor >= 4),
+        None => false,
+    }
+}
+
+/// Parse `5.2` or `5.2.15` into `(major, minor)`. Anything else — including the
+/// bare `.` that `bash -c` prints when `BASH_VERSINFO` is unset — is rejected.
+fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// The hook for a shell. Bash depends on the version probed on that host; every
+/// other shell has a single form.
+fn hook_for(shell: &str, bash_version: Option<&str>) -> Hook {
+    match shell {
+        "bash" if bash_supports_ps0(bash_version) => Hook::BashPs0,
+        "bash" => Hook::BashDebugTrap,
+        "zsh" => Hook::Zsh,
+        _ => Hook::Fish,
+    }
 }
 
 /// Build the shell snippet that starts the agent and sends each command via `boom-sshend`.
 /// boom-sshend auto-detects hostname, uid, pid — the hook only passes the command.
 /// Deduplication is handled by the agent (not the shell).
-fn build_trap_block(shell: &str) -> String {
-    let mut block = String::new();
+fn build_trap_block(hook: Hook) -> String {
+    let startup = match hook {
+        Hook::Fish => "eval (boom-sshh agent)\n",
+        _ => "eval \"$(boom-sshh agent)\"\n",
+    };
 
-    // Agent startup — reuse existing or start new (agent handles detection)
-    match shell {
-        "fish" => block.push_str("eval (boom-sshh agent)\n"),
-        _ => block.push_str("eval \"$(boom-sshh agent)\"\n"),
-    }
+    // The `>/dev/null 2>&1` on the PS0 substitution is load-bearing: PS0's
+    // substitution output is rendered into the prompt, and boom-sshend prints an
+    // error string when it cannot reach the agent.
+    let capture = match hook {
+        Hook::BashPs0 => "PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${PS0:-}\"\n",
+        Hook::BashDebugTrap => "trap 'boom-sshend \"$(history 1)\"' DEBUG\n",
+        Hook::Zsh => "TRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n",
+        Hook::Fish => "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n",
+    };
 
-    // Command capture — send commands to the agent
-    match shell {
-        "fish" => block.push_str(
-            "function __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n",
-        ),
-        "zsh" => block.push_str("TRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n"),
-        _ => block.push_str(&bash_capture_line()),
+    format!("{startup}{capture}")
+}
+
+/// Replace any boom-sshh lines in `contents` with the block for `hook`, and
+/// return the new file contents.
+///
+/// The one place that decides what a configured rc file looks like, so the local
+/// and remote paths cannot drift apart again. Appending is idempotent: editing a
+/// file that is already up to date returns it unchanged.
+fn with_block_replaced(contents: &str, shell: &str, hook: Hook) -> String {
+    let mut out = remove_existing_traps(contents, shell);
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
     }
-    block
+    out.push_str(&build_trap_block(hook));
+    out
+}
+
+/// Remote command that replaces `path` with `contents`.
+///
+/// Written through a sibling temp file so a dropped connection cannot leave the
+/// config truncated, with `cp -p` carrying the original mode onto the
+/// replacement. The heredoc delimiter is quoted, so nothing in `contents` — the
+/// `$(boom-sshend …)` and `${PS0:-}` of the hook included — is expanded by the
+/// remote shell.
+fn write_block_command(path: &str, contents: &str) -> String {
+    let tmp = format!("{path}.boomsshh.tmp");
+    format!(
+        "[ -f {path} ] && cp -p {path} {tmp}; cat > {tmp} << 'HISTEOF'\n{contents}HISTEOF\nmv {tmp} {path}"
+    )
 }
 
 /// Remove all existing boom-ssh lines from config contents.
@@ -149,18 +228,22 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
     println!("remote arch: {}", info.arch);
     println!("client: {client_arch}");
 
-    // Determine which config files to inject into
-    let mut configs: Vec<(&str, String)> = Vec::new();
+    // Determine which config files to inject into, and which capture hook each
+    // one needs. For bash that depends on the version we probed on the host.
+    let mut configs: Vec<(&str, Hook)> = Vec::new();
     if info.bashrc {
-        configs.push(("~/.bashrc", build_trap_block("bash")));
+        let hook = hook_for("bash", info.bash_version.as_deref());
+        let bash_ver = info.bash_version.as_deref().unwrap_or("unknown");
+        println!("bash:     {bash_ver} -> {}", hook.label());
+        configs.push(("~/.bashrc", hook));
     }
     if info.zshrc {
-        configs.push(("~/.zshrc", build_trap_block("zsh")));
+        configs.push(("~/.zshrc", Hook::Zsh));
     }
     if info.fish_config {
         configs.push((
             "~/.config/fish/conf.d/boom-sshh.fish",
-            build_trap_block("fish"),
+            Hook::Fish,
         ));
     }
 
@@ -184,15 +267,56 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
         println!("boom-sshend: not installed");
     }
 
-    for (path, _) in &configs {
-        let already = std::fs::read_to_string(path)
-            .map(|c| c.contains(CONFIG_SENTINEL))
-            .unwrap_or(false);
-        if dry_run {
-            println!("{path}: would {}", if already { "update trap" } else { "inject trap" });
+    // Work out the new contents of each rc file now, by reading it over the same
+    // muxed connection. Doing it up front lets --dry-run report what a real run
+    // would do, and lets a file that is already correct be left untouched.
+    struct ConfigPlan<'a> {
+        path: &'a str,
+        hook: Hook,
+        /// Whether the file existed; a missing one is created.
+        exists: bool,
+        /// New file contents: existing boom-sshh lines swapped for this hook.
+        updated: String,
+        /// `false` when the remote file already matches `updated`.
+        needs_write: bool,
+    }
+
+    let mut plans: Vec<ConfigPlan> = Vec::new();
+    for (path, hook) in &configs {
+        let exists = ssh_exec(ssh_args, host, &format!("test -f {path}"), &control_path).is_ok();
+        // A file that exists but will not read is fatal: building new contents
+        // from an empty buffer would throw away the user's config.
+        let current = if exists {
+            match ssh_exec(ssh_args, host, &format!("cat {path}"), &control_path) {
+                Ok(contents) => contents,
+                Err(e) => {
+                    eprintln!("error: cannot read {path} on {host}: {e}");
+                    close_mux(&control_path, ssh_args, host);
+                    std::process::exit(1);
+                }
+            }
         } else {
-            println!("{path}: {}", if already { "already configured" } else { "will inject trap" });
-        }
+            String::new()
+        };
+        let updated = with_block_replaced(&current, hook.shell(), *hook);
+        plans.push(ConfigPlan {
+            path,
+            hook: *hook,
+            exists,
+            needs_write: !(exists && updated == current),
+            updated,
+        });
+    }
+
+    for p in &plans {
+        let action = match (p.needs_write, p.exists) {
+            (false, _) => "already up to date".to_string(),
+            (true, true) if dry_run => "would replace boom-sshh block".to_string(),
+            (true, true) => "will replace boom-sshh block".to_string(),
+            (true, false) if dry_run => "would create with boom-sshh block".to_string(),
+            (true, false) => "will create with boom-sshh block".to_string(),
+        };
+        println!("{:<44} {} ({})", p.path, action, p.hook.label());
     }
 
     if dry_run {
@@ -303,43 +427,37 @@ pub fn run_init(args: &[String], dry_run: bool) -> Result<(), Box<dyn std::error
 
     println!("boom-sshend installed to ~/.local/bin/boom-sshend");
 
-    // Inject trap blocks
-    for (path, block) in &configs {
-        println!("injecting trap into {path}...");
-
-        // Check if already configured
-        let check_cmd = format!("grep -q '{CONFIG_SENTINEL}' {path} 2>/dev/null");
-        let already_configured = ssh_exec(ssh_args, host, &check_cmd, &control_path).is_ok();
-
-        if already_configured {
-            println!("  {path}: already configured — skipping");
+    // Replace the boom-sshh lines in each rc file. Writing goes through a sibling
+    // temp file so the real file is never left truncated if the connection drops,
+    // and `cp -p` carries the original mode onto the replacement. A file that
+    // already matches is not written at all.
+    for p in &plans {
+        if !p.needs_write {
             continue;
         }
+        println!("updating {}...", p.path);
 
-        // Append block via heredoc
-        let append_cmd = format!(
-            "cat >> {path} << 'HISTEOF'\n{block}\nHISTEOF"
-        );
-        let mut append_args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
-        append_args.extend(mux_opts(&control_path));
-        append_args.extend([
+        let write_cmd = write_block_command(p.path, &p.updated);
+        let mut write_args: Vec<String> = ssh_args.iter().map(|s| s.to_string()).collect();
+        write_args.extend(mux_opts(&control_path));
+        write_args.extend([
             "-t".to_string(),
             host.to_string(),
             "--".to_string(),
             "bash".to_string(),
             "-c".to_string(),
-            append_cmd,
+            write_cmd,
         ]);
 
-        let status = Command::new("ssh").args(&append_args).status()?;
+        let status = Command::new("ssh").args(&write_args).status()?;
         if !status.success() {
-            eprintln!("error: failed to inject trap into {path}");
+            eprintln!("error: failed to update {}", p.path);
             eprintln!("       (check that your key is loaded in the agent: ssh-add -l)");
             close_mux(&control_path, ssh_args, host);
             std::process::exit(1);
         }
 
-        println!("  {path}: done");
+        println!("  {}: done ({})", p.path, p.hook.label());
     }
 
     // Cleanup
@@ -385,9 +503,26 @@ pub fn run_init_agent(dry_run: bool, assume_yes: bool) -> Result<(), Box<dyn std
 
     let config_display = config_path.to_str().unwrap_or("?");
 
+    // Pick the capture hook from the shell and, for bash, the local bash version,
+    // so the rc file needs no runtime version test.
+    let bash_version = if shell_name == "bash" {
+        detect_local_bash_version()
+    } else {
+        None
+    };
+    let hook = hook_for(shell_name, bash_version.as_deref());
+
     // ── Detect shell and config ──
     println!("shell:    {shell_name}");
     println!("config:   {config_display}");
+    match shell_name {
+        "bash" => println!(
+            "bash:     {} -> {}",
+            bash_version.as_deref().unwrap_or("unknown"),
+            hook.label()
+        ),
+        _ => println!("hook:     {}", hook.label()),
+    }
 
     // ── Pre-flight conflict checks ──
     let mut warnings: Vec<String> = Vec::new();
@@ -474,21 +609,13 @@ pub fn run_init_agent(dry_run: bool, assume_yes: bool) -> Result<(), Box<dyn std
     // Check if boom-sshh is in the install dir, copy if not
     install_agent_binary(&install_dir)?;
 
-    // Build and inject the trap block
-    let block = build_trap_block(shell_name);
+    // Replace the boom-sshh block with the one for the hook chosen above.
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // Remove existing trap blocks before appending new one
     let raw = fs::read_to_string(&config_path).unwrap_or_default();
-    let cleaned = remove_existing_traps(&raw, shell_name);
-    let mut contents = cleaned;
-    if !contents.ends_with('\n') {
-        contents.push('\n');
-    }
-    contents.push_str(&block);
-    contents.push('\n');
+    let contents = with_block_replaced(&raw, shell_name, hook);
     fs::write(&config_path, &contents)?;
 
     println!("config:    {config_display} — done");
@@ -738,6 +865,20 @@ fn detect_local_shell() -> String {
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
+/// `MAJOR.MINOR` of the local bash, or `None` when bash is missing or its output
+/// is not a version. The hook for `~/.bashrc` is decided from this.
+fn detect_local_bash_version() -> Option<String> {
+    let out = Command::new("bash")
+        .args(["-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    parse_major_minor(&version).map(|_| version)
+}
+
 // ── remote detection ────────────────────────────────────────────
 
 fn detect_remote(
@@ -769,12 +910,26 @@ fn detect_remote(
     .map(|s| s.trim() == "yes")
     .unwrap_or(false);
 
+    // The hook we write depends on the host's bash, so read its version here
+    // rather than testing it from the rc file on every shell start. Single
+    // quotes keep the remote login shell from expanding the array.
+    let bash_version = ssh_exec(
+        ssh_args,
+        host,
+        "bash -c 'echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}'",
+        control_path,
+    )
+    .ok()
+    .map(|v| v.trim().to_string())
+    .filter(|v| parse_major_minor(v).is_some());
+
     Ok(RemoteInfo {
         arch,
         client_installed,
         bashrc,
         zshrc,
         fish_config,
+        bash_version,
     })
 }
 
@@ -907,65 +1062,187 @@ mod tests {
     }
 
     #[test]
-    fn test_bash_block_prefers_ps0_with_debug_fallback() {
-        let block = build_trap_block("bash");
+    fn test_bash_ps0_block_has_no_runtime_version_test() {
+        let block = build_trap_block(Hook::BashPs0);
 
-        assert!(block.contains("BASH_VERSINFO"), "needs a bash version guard:\n{block}");
         assert!(
             block.contains("PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${PS0:-}\""),
             "needs the PS0 hook (appending, with output redirected):\n{block}"
         );
         assert!(
-            block.contains("else trap 'boom-sshend \"$(history 1)\"' DEBUG; fi"),
-            "needs the DEBUG fallback for bash < 4.4:\n{block}"
+            !block.contains("BASH_VERSINFO"),
+            "the version is decided at init time, not in the rc file:\n{block}"
         );
-        // The hook must not be the sole mechanism, and must stay on one line so
-        // the line-based stripper can remove it.
+        assert!(!block.contains("trap "), "no DEBUG trap on the PS0 path:\n{block}");
         assert_eq!(block.lines().count(), 2, "bash block should be exactly two lines:\n{block}");
+    }
+
+    #[test]
+    fn test_bash_debug_trap_block_for_old_bash() {
+        let block = build_trap_block(Hook::BashDebugTrap);
+
+        assert_eq!(
+            block,
+            "eval \"$(boom-sshh agent)\"\ntrap 'boom-sshend \"$(history 1)\"' DEBUG\n"
+        );
     }
 
     #[test]
     fn test_zsh_and_fish_blocks_unchanged() {
         assert_eq!(
-            build_trap_block("zsh"),
+            build_trap_block(Hook::Zsh),
             "eval \"$(boom-sshh agent)\"\nTRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n"
         );
         assert_eq!(
-            build_trap_block("fish"),
+            build_trap_block(Hook::Fish),
             "eval (boom-sshh agent)\nfunction __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n"
         );
     }
 
     #[test]
-    fn test_bash_version_guard_selects_ps0() {
-        // Run the guard that the generated block embeds: it must pick the PS0
-        // branch on a bash that has PS0 (4.4+) and the trap branch otherwise.
-        let script = format!("if {BASH_PS0_GUARD}; then echo ps0; else echo trap; fi");
-        let out = Command::new("bash").arg("-c").arg(&script).output().unwrap();
-        let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    fn test_write_block_command_is_quoted_and_atomic() {
+        let contents = "PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${PS0:-}\"\n";
+        let cmd = write_block_command("~/.bashrc", contents);
 
-        let ver = Command::new("bash")
-            .arg("-c")
-            .arg("echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}")
-            .output()
-            .unwrap();
-        let ver = String::from_utf8_lossy(&ver.stdout).trim().to_string();
-        let (major, minor) = ver
-            .split_once('.')
-            .map(|(a, b)| (a.parse::<u32>().unwrap_or(0), b.parse::<u32>().unwrap_or(0)))
-            .unwrap_or((0, 0));
-        let expect = if major > 4 || (major == 4 && minor >= 4) { "ps0" } else { "trap" };
+        // Replace through a sibling temp file, preserving mode; the real config is
+        // never truncated in place.
+        assert!(cmd.contains("[ -f ~/.bashrc ] && cp -p ~/.bashrc ~/.bashrc.boomsshh.tmp"), "{cmd}");
+        assert!(cmd.contains("mv ~/.bashrc.boomsshh.tmp ~/.bashrc"), "{cmd}");
+        // Quoted delimiter: the hook's `$(…)` and `${…}` must reach the rc file
+        // exactly as written, and the delimiter must be a whole line of its own.
+        assert!(cmd.contains("<< 'HISTEOF'"), "{cmd}");
+        assert!(cmd.contains(contents), "contents must be verbatim:\n{cmd}");
+        assert_eq!(cmd.lines().filter(|l| *l == "HISTEOF").count(), 1, "{cmd}");
+    }
 
-        assert_eq!(picked, expect, "bash {ver} picked the wrong capture branch");
+    #[test]
+    fn test_hook_shell_names() {
+        assert_eq!(Hook::BashPs0.shell(), "bash");
+        assert_eq!(Hook::BashDebugTrap.shell(), "bash");
+        assert_eq!(Hook::Zsh.shell(), "zsh");
+        assert_eq!(Hook::Fish.shell(), "fish");
+    }
+
+    #[test]
+    fn test_with_block_replaced_is_idempotent() {
+        // The remote path relies on this: re-running init must not accumulate
+        // blocks, and an unchanged file must compare equal so it is not rewritten.
+        for hook in [Hook::BashPs0, Hook::BashDebugTrap, Hook::Zsh, Hook::Fish] {
+            let rc = "export PATH=$PATH:$HOME/.local/bin\nalias ll='ls -l'\n";
+            let once = with_block_replaced(rc, hook.shell(), hook);
+            let twice = with_block_replaced(&once, hook.shell(), hook);
+            assert_eq!(once, twice, "{hook:?} accumulated a block:\n{twice}");
+            assert_eq!(
+                once.lines().filter(|l| l.contains("boom-sshend")).count(),
+                1,
+                "{hook:?} should leave exactly one hook line:\n{once}"
+            );
+            assert!(once.starts_with(rc), "{hook:?} must keep user lines:\n{once}");
+        }
+    }
+
+    #[test]
+    fn test_with_block_replaced_swaps_hook_both_ways() {
+        // A host whose bash was upgraded must end up on PS0 alone...
+        let legacy = with_block_replaced("", "bash", Hook::BashDebugTrap);
+        let upgraded = with_block_replaced(&legacy, "bash", Hook::BashPs0);
+        assert!(upgraded.contains("PS0="), "{upgraded}");
+        assert!(
+            !upgraded.contains("trap 'boom-sshend"),
+            "the old trap must be gone, not duplicated:\n{upgraded}"
+        );
+
+        // ...and one that reads as older, or whose version we cannot read, goes
+        // back to the trap rather than keeping PS0.
+        let downgraded = with_block_replaced(&upgraded, "bash", Hook::BashDebugTrap);
+        assert_eq!(downgraded.matches("trap 'boom-sshend").count(), 1, "{downgraded}");
+        assert!(!downgraded.contains("PS0="), "{downgraded}");
+    }
+
+    #[test]
+    fn test_with_block_replaced_migrates_unmarked_fish() {
+        // Fish configs written before this change have no marker and no single
+        // line we could match: the whole function has to be removed.
+        let legacy = concat!(
+            "set -gx EDITOR vim\n",
+            "eval (boom-sshh agent)\n",
+            "function __boomssh_preexec --on-event fish_preexec\n",
+            "    if test -n \"$argv[1]\"\n",
+            "        boom-sshend \"$argv[1]\"\n",
+            "    end\n",
+            "end\n",
+        );
+        let updated = with_block_replaced(legacy, "fish", Hook::Fish);
+        assert_eq!(updated.matches("function __boomssh_preexec").count(), 1, "{updated}");
+        assert_eq!(updated.matches("boom-sshend").count(), 1, "{updated}");
+        assert!(updated.starts_with("set -gx EDITOR vim\n"), "user lines lost:\n{updated}");
+    }
+
+    #[test]
+    fn test_bash_supports_ps0() {
+        for (version, expected) in [
+            (None, false),          // bash missing or version unreadable
+            (Some("."), false),     // BASH_VERSINFO unset produced just a dot
+            (Some(""), false),
+            (Some("nonsense"), false),
+            (Some("3.2"), false),
+            (Some("4.3"), false),
+            (Some("4.4"), true),    // first release with PS0
+            (Some("4.9"), true),
+            (Some("5.0"), true),
+            (Some("5.2"), true),
+            (Some("5.2.15"), true), // patch level is ignored
+            (Some("6.1"), true),
+        ] {
+            assert_eq!(
+                bash_supports_ps0(version),
+                expected,
+                "bash_supports_ps0({version:?}) should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_choice_per_shell() {
+        assert_eq!(hook_for("bash", Some("5.2")), Hook::BashPs0);
+        assert_eq!(hook_for("bash", Some("4.4")), Hook::BashPs0);
+        assert_eq!(hook_for("bash", Some("4.3")), Hook::BashDebugTrap);
+        assert_eq!(hook_for("bash", Some("3.2")), Hook::BashDebugTrap);
+        // Version unreadable: the DEBUG trap works on every bash.
+        assert_eq!(hook_for("bash", None), Hook::BashDebugTrap);
+        assert_eq!(hook_for("zsh", None), Hook::Zsh);
+        assert_eq!(hook_for("fish", None), Hook::Fish);
+    }
+
+    #[test]
+    fn test_bash_hook_lines_are_valid_bash() {
+        // Skip where bash is unavailable rather than failing on the host.
+        if Command::new("bash").arg("-c").arg(":").output().is_err() {
+            return;
+        }
+        for hook in [Hook::BashPs0, Hook::BashDebugTrap] {
+            let file = std::env::temp_dir().join(format!("bshh-hook-{hook:?}.sh"));
+            std::fs::write(&file, build_trap_block(hook)).unwrap();
+            let out = Command::new("bash").arg("-n").arg(&file).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{hook:?} hook does not parse: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let _ = std::fs::remove_file(&file);
+        }
     }
 
     #[test]
     fn test_remove_existing_traps_strips_legacy_and_ps0() {
+        // One rc holding every form we have written: the 0.3.x DEBUG trap, the
+        // 0.4.0 version-guarded PS0 line, and the current bare PS0 line.
         let rc = concat!(
             "export PATH=$PATH:$HOME/.local/bin\n",
             "eval \"$(boom-sshh agent)\"\n",
             "trap 'boom-sshend \"$(history 1)\"' DEBUG\n",
             "if [ -n \"${BASH_VERSINFO:-}\" ]; then PS0='$(boom-sshend \"$(history 1)\")'\"${PS0:-}\"; fi\n",
+            "PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${PS0:-}\"\n",
             "alias ll='ls -l'\n",
         );
         let cleaned = remove_existing_traps(rc, "bash");
@@ -973,7 +1250,7 @@ mod tests {
 
         // Injecting the current block and cleaning again must return the same
         // file (init-agent removes the old block before appending the new one).
-        let injected = format!("{cleaned}{}", build_trap_block("bash"));
+        let injected = format!("{cleaned}{}", build_trap_block(Hook::BashPs0));
         assert_eq!(
             injected.lines().filter(|l| l.contains("boom-sshend")).count(),
             1,
@@ -992,7 +1269,7 @@ mod tests {
         assert_eq!(remove_existing_traps(rc, "fish"), "");
 
         // Same idempotency property as bash: re-injecting leaves nothing behind.
-        let injected = build_trap_block("fish");
+        let injected = build_trap_block(Hook::Fish);
         assert_eq!(
             injected.lines().filter(|l| l.contains("boom-sshend")).count(),
             1,

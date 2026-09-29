@@ -88,7 +88,15 @@ record of what was signed.
 
 ## `init` (remote)
 
-Detects remote shell (bash/zsh/fish), installs `boom-sshend`, and injects the trap into shell config files.
+Detects remote shell (bash/zsh/fish) and the remote bash version, installs `boom-sshend`, and writes the appropriate hook into shell config files.
+
+`init` replaces any boom-sshh lines already in those files rather than skipping
+them, so re-running it re-decides the hook against the host's current bash — a
+host upgraded to bash 5 moves from the `DEBUG` trap to `PS0`. Everything else in
+the file is left as it was. The new contents are written through a sibling temp
+file and moved into place, so a dropped connection cannot leave a truncated
+config, and the original file mode is carried over. A file that is already
+correct is reported as up to date and not rewritten at all.
 
 ```bash
 boom-sshh init user@remote-host
@@ -142,21 +150,37 @@ boom-sshend auto-detects hostname, uid, pid — the hook only passes the command
 
 ### Bash (`~/.bashrc`)
 
-Bash 4.4 and newer use `PS0`, which runs the hook after each command is read and
-avoids the `DEBUG` trap conflicts common in preconfigured bash 5 environments.
-Older bash falls back to the `DEBUG` trap:
+`init` reads the host's bash version and writes the hook that suits it, so the rc
+file holds one unconditional line. Bash 4.4 and newer get `PS0`, which runs the
+hook after each command is read and avoids the `DEBUG` trap conflicts common in
+preconfigured bash 5 environments:
 
 ```bash
 eval "$(boom-sshh agent)"
-if [ -n "${BASH_VERSINFO:-}" ] && { [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 4 ]; }; }; then PS0='$(boom-sshend "$(history 1)" >/dev/null 2>&1)'"${PS0:-}"; else trap 'boom-sshend "$(history 1)"' DEBUG; fi
+PS0='$(boom-sshend "$(history 1)" >/dev/null 2>&1)'"${PS0:-}"
 ```
 
-The `>/dev/null 2>&1` matters: `PS0`'s command-substitution output is rendered
-into the prompt, so anything `boom-sshend` prints would appear on the prompt line.
+Older bash gets the `DEBUG` trap, which every bash supports:
 
-`init` skips a host whose rc file already contains a `boom-sshend` line, so a
-host configured before this change keeps its `DEBUG` trap. To migrate one, delete
-the `boom-sshend` lines from its `~/.bashrc`, then re-run `boom-sshh init <host>`.
+```bash
+eval "$(boom-sshh agent)"
+trap 'boom-sshend "$(history 1)"' DEBUG
+```
+
+Either way `init` and `init-agent` print which hook they chose (and the version
+they read) before writing, so `--dry-run` shows the decision without touching the
+file. When the version cannot be read — bash missing, or output that is not a
+version — the `DEBUG` trap is used.
+
+The `>/dev/null 2>&1` on the `PS0` line matters: `PS0`'s command-substitution
+output is rendered into the prompt, so anything `boom-sshend` prints would appear
+on the prompt line.
+
+The same replacement logic runs locally and remotely: the config file is read,
+the boom-sshh lines are removed, and the block for the chosen hook is appended.
+Files written by earlier versions migrate on the next run — including fish
+configs, whose preexec function is removed as a whole rather than only its first
+line.
 
 ### Zsh (`~/.zshrc`)
 
