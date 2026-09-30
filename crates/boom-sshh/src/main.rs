@@ -6,7 +6,7 @@ use crate::agent::{policy_snapshot_path, ApprovedRule};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ssh_agent_lib::agent::listen;
 
@@ -188,9 +188,13 @@ fn print_agent_help() {
     println!("  boom-sshh agent --yolo         Start the agent, approve every request");
     println!();
     println!("--yolo disables approval: no approver is spawned and every sign request");
-    println!("is allowed. It takes precedence over BOOM_SSHH_ASKPASS. It cannot apply to");
-    println!("an agent that is already running — that invocation fails with an error and");
-    println!("leaves the existing agent in place (kill its pid to restart with --yolo).");
+    println!("is allowed. It takes precedence over BOOM_SSHH_ASKPASS. It only applies when");
+    println!("the agent starts: if one is already running in another mode, --yolo is");
+    println!("ignored with a warning on stderr, and the shell still gets that agent's");
+    println!("socket. Kill its pid and start again to change modes.");
+    println!();
+    println!("If SSH_AUTH_SOCK points at a different ssh-agent, that agent is reported");
+    println!("and boom-sshh starts anyway, so this shell uses boom-sshh.");
     println!();
     println!("Approval decisions are always written to the auth log; in --yolo mode the");
     println!("history log is the only record of what was signed.");
@@ -374,17 +378,36 @@ fn run_policy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// The exports always go to stdout: a shell rc that runs
 /// `eval "$(boom-sshh agent --yolo)"` must still end up with a usable socket.
-/// With `yolo` the running agent was not started with the flag, so the refusal
-/// goes to stderr and the exit status is non-zero — the flag is never silently
-/// ignored, but the calling shell keeps working.
-fn reuse_agent(sock: &str, pid: u32, yolo: bool) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Reusing a live agent is never an error — the calling shell has to keep
+/// working. `--yolo` cannot change a running agent's mode, so when the mode
+/// recorded by that agent differs the mismatch is reported as a warning.
+fn reuse_agent(
+    sock: &str,
+    pid: u32,
+    yolo: bool,
+    mode_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;");
     println!("SSH_AGENT_PID={pid}; export SSH_AGENT_PID;");
     println!("echo Agent pid {pid};");
+
     if yolo {
-        eprintln!("error: --yolo has no effect: agent pid {pid} is already running without it");
-        eprintln!("       kill {pid} (or: kill $(cat ~/.boom-sshh/agent.pid)) and start it again");
-        std::process::exit(1);
+        let recorded = fs::read_to_string(mode_path)
+            .map(|m| m.trim().to_string())
+            .ok();
+        match recorded.as_deref() {
+            // Already running the mode that was asked for: nothing to say.
+            Some("yolo") => {}
+            Some(mode) => {
+                eprintln!("warning: agent pid {pid} is already running in {mode} mode, so --yolo has no effect");
+                eprintln!("         kill {pid} and start it again to change modes");
+            }
+            None => {
+                eprintln!("warning: agent pid {pid} is already running, so --yolo has no effect");
+                eprintln!("         kill {pid} and start it again to change modes");
+            }
+        }
     }
     Ok(())
 }
@@ -405,15 +428,27 @@ fn run_agent_daemon(yolo: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::create_dir_all(&agent_dir);
     let fixed_sock = agent_dir.join("agent.sock");
     let pid_path = agent_dir.join("agent.pid");
+    let mode_path = agent_dir.join("agent.mode");
+    let fixed_sock_str = fixed_sock.to_string_lossy().into_owned();
 
-    // Fast path: inherited env vars point at a live agent.
+    // Fast path: the environment already points at OUR agent, which is the common
+    // case for a child shell. Any other live agent in SSH_AUTH_SOCK (gdm's
+    // gnome-keyring agent, a leftover ssh-agent) must not be adopted: doing so
+    // would leave boom-sshh out of the loop entirely, with nothing logged and no
+    // approvals. Say so, then take over below as the rc line intends.
     if let (Ok(sock), Ok(pid_str)) = (
         std::env::var("SSH_AUTH_SOCK"),
         std::env::var("SSH_AGENT_PID"),
     ) {
         if let Ok(pid) = pid_str.parse::<u32>() {
-            if std::path::Path::new(&sock).exists() && unsafe { libc::kill(pid as i32, 0) } == 0 {
-                return reuse_agent(&sock, pid, yolo);
+            let live = std::path::Path::new(&sock).exists()
+                && unsafe { libc::kill(pid as i32, 0) } == 0;
+            if live && sock == fixed_sock_str {
+                return reuse_agent(&sock, pid, yolo, &mode_path);
+            }
+            if live {
+                eprintln!("note: SSH_AUTH_SOCK points at another agent ({sock}, pid {pid})");
+                eprintln!("      starting boom-sshh as this shell's agent");
             }
         }
     }
@@ -422,14 +457,14 @@ fn run_agent_daemon(yolo: bool) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(pid_s) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_s.trim().parse::<u32>() {
             if fixed_sock.exists() && unsafe { libc::kill(pid as i32, 0) } == 0 {
-                let sock = fixed_sock.to_string_lossy().into_owned();
-                return reuse_agent(&sock, pid, yolo);
+                return reuse_agent(&fixed_sock_str, pid, yolo, &mode_path);
             }
         }
     }
-    // Stale socket/pid file from a dead agent — clean up before binding.
+    // Stale socket/pid/mode files from a dead agent — clean up before binding.
     let _ = fs::remove_file(&fixed_sock);
     let _ = fs::remove_file(&pid_path);
+    let _ = fs::remove_file(&mode_path);
 
     // Determine socket path (fixed singleton location, or TEST_SSH_AUTH_SOCK).
     let socket_path = if let Ok(test_sock) = std::env::var("TEST_SSH_AUTH_SOCK") {
@@ -501,9 +536,11 @@ fn run_agent_daemon(yolo: bool) -> Result<(), Box<dyn std::error::Error>> {
         libc::close(libc::STDOUT_FILENO);
         libc::close(libc::STDERR_FILENO);
     }
-    // Record our pid so future shells can discover and reuse this singleton.
-    // (fork() returns 0 in the child, so use the real pid here.)
+    // Record our pid so future shells can discover and reuse this singleton, and
+    // our mode so a later `agent --yolo` can tell whether it was already honoured
+    // instead of guessing. (fork() returns 0 in the child, so use the real pid.)
     let _ = fs::write(&pid_path, std::process::id().to_string());
+    let _ = fs::write(&mode_path, if yolo { "yolo" } else { "normal" });
 
     // Create fresh tokio runtime in child
     let rt = tokio::runtime::Runtime::new()?;

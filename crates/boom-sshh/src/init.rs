@@ -81,13 +81,42 @@ fn hook_for(shell: &str, bash_version: Option<&str>) -> Hook {
     }
 }
 
+/// Agent flags we know how to keep when rewriting an existing startup line.
+const KEEPABLE_AGENT_FLAGS: [&str; 1] = ["--yolo"];
+
+/// Agent flags already present on a startup line, filtered to the ones we
+/// understand.
+///
+/// Lets `init`/`init-agent` rewrite the block without discarding a mode the user
+/// chose, such as `agent --yolo`. Unknown flags are dropped rather than carried
+/// forward: a flag the CLI no longer accepts would break every new shell.
+fn kept_agent_flags(contents: &str) -> Vec<String> {
+    for line in contents.lines() {
+        if line.contains("boom-sshh agent") && line.contains("eval") {
+            if let Some(rest) = line.split("boom-sshh agent").nth(1) {
+                return rest
+                    .split(|c: char| c.is_whitespace() || matches!(c, ')' | '"' | '\''))
+                    .filter(|token| KEEPABLE_AGENT_FLAGS.contains(token))
+                    .map(str::to_string)
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Build the shell snippet that starts the agent and sends each command via `boom-sshend`.
 /// boom-sshend auto-detects hostname, uid, pid — the hook only passes the command.
 /// Deduplication is handled by the agent (not the shell).
-fn build_trap_block(hook: Hook) -> String {
+fn build_trap_block(hook: Hook, agent_flags: &[String]) -> String {
+    let flags = match agent_flags.is_empty() {
+        true => String::new(),
+        false => format!(" {}", agent_flags.join(" ")),
+    };
+
     let startup = match hook {
-        Hook::Fish => "eval (boom-sshh agent)\n",
-        _ => "eval \"$(boom-sshh agent)\"\n",
+        Hook::Fish => format!("eval (boom-sshh agent{flags})\n"),
+        _ => format!("eval \"$(boom-sshh agent{flags})\"\n"),
     };
 
     // The `>/dev/null 2>&1` on the PS0 substitution is load-bearing: PS0's
@@ -114,7 +143,7 @@ fn with_block_replaced(contents: &str, shell: &str, hook: Hook) -> String {
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&build_trap_block(hook));
+    out.push_str(&build_trap_block(hook, &kept_agent_flags(contents)));
     out
 }
 
@@ -1090,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_bash_ps0_block_has_no_runtime_version_test() {
-        let block = build_trap_block(Hook::BashPs0);
+        let block = build_trap_block(Hook::BashPs0, &[]);
 
         assert!(
             block.contains("PS0='$(boom-sshend \"$(history 1)\" >/dev/null 2>&1)'\"${PS0:-}\""),
@@ -1106,7 +1135,7 @@ mod tests {
 
     #[test]
     fn test_bash_debug_trap_block_for_old_bash() {
-        let block = build_trap_block(Hook::BashDebugTrap);
+        let block = build_trap_block(Hook::BashDebugTrap, &[]);
 
         assert_eq!(
             block,
@@ -1117,11 +1146,11 @@ mod tests {
     #[test]
     fn test_zsh_and_fish_blocks_unchanged() {
         assert_eq!(
-            build_trap_block(Hook::Zsh),
+            build_trap_block(Hook::Zsh, &[]),
             "eval \"$(boom-sshh agent)\"\nTRAPDEBUG='boom-sshend \"$(fc -l -1)\"'\n"
         );
         assert_eq!(
-            build_trap_block(Hook::Fish),
+            build_trap_block(Hook::Fish, &[]),
             "eval (boom-sshh agent)\nfunction __boomssh_preexec --on-event fish_preexec\n    if test -n \"$argv[1]\"\n        boom-sshend \"$argv[1]\"\n    end\nend\n"
         );
     }
@@ -1140,6 +1169,38 @@ mod tests {
         assert!(cmd.contains("<< 'HISTEOF'"), "{cmd}");
         assert!(cmd.contains(contents), "contents must be verbatim:\n{cmd}");
         assert_eq!(cmd.lines().filter(|l| *l == "HISTEOF").count(), 1, "{cmd}");
+    }
+
+    #[test]
+    fn test_kept_agent_flags() {
+        assert_eq!(kept_agent_flags("eval \"$(boom-sshh agent --yolo)\"\n"), vec!["--yolo"]);
+        assert_eq!(kept_agent_flags("eval (boom-sshh agent --yolo)\n"), vec!["--yolo"]);
+        assert_eq!(kept_agent_flags("eval \"$(boom-sshh agent)\"\n"), Vec::<String>::new());
+        // A flag the CLI might not accept any more is dropped, not carried on.
+        assert_eq!(
+            kept_agent_flags("eval \"$(boom-sshh agent --something-else)\"\n"),
+            Vec::<String>::new()
+        );
+        // Only our own startup line counts, and a bare mention is not one.
+        assert_eq!(kept_agent_flags("# boom-sshh agent --yolo\n"), Vec::<String>::new());
+        assert_eq!(kept_agent_flags(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_with_block_replaced_keeps_the_mode_flag() {
+        let rc = "alias ll='ls -l'\neval \"$(boom-sshh agent --yolo)\"\n";
+        let updated = with_block_replaced(rc, "bash", Hook::BashPs0);
+        assert!(
+            updated.contains("eval \"$(boom-sshh agent --yolo)\""),
+            "rewriting must not silently turn approvals back on:\n{updated}"
+        );
+        // ...and it survives repeated rewrites.
+        assert_eq!(with_block_replaced(&updated, "bash", Hook::BashPs0), updated);
+
+        // A plain startup line stays plain.
+        let plain = with_block_replaced("eval \"$(boom-sshh agent)\"\n", "bash", Hook::BashPs0);
+        assert!(plain.contains("eval \"$(boom-sshh agent)\"\n"), "{plain}");
+        assert!(!plain.contains("--yolo"), "{plain}");
     }
 
     #[test]
@@ -1249,7 +1310,7 @@ mod tests {
         }
         for hook in [Hook::BashPs0, Hook::BashDebugTrap] {
             let file = std::env::temp_dir().join(format!("bshh-hook-{hook:?}.sh"));
-            std::fs::write(&file, build_trap_block(hook)).unwrap();
+            std::fs::write(&file, build_trap_block(hook, &[])).unwrap();
             let out = Command::new("bash").arg("-n").arg(&file).output().unwrap();
             assert!(
                 out.status.success(),
@@ -1277,7 +1338,7 @@ mod tests {
 
         // Injecting the current block and cleaning again must return the same
         // file (init-agent removes the old block before appending the new one).
-        let injected = format!("{cleaned}{}", build_trap_block(Hook::BashPs0));
+        let injected = format!("{cleaned}{}", build_trap_block(Hook::BashPs0, &[]));
         assert_eq!(
             injected.lines().filter(|l| l.contains("boom-sshend")).count(),
             1,
@@ -1296,7 +1357,7 @@ mod tests {
         assert_eq!(remove_existing_traps(rc, "fish"), "");
 
         // Same idempotency property as bash: re-injecting leaves nothing behind.
-        let injected = build_trap_block(Hook::Fish);
+        let injected = build_trap_block(Hook::Fish, &[]);
         assert_eq!(
             injected.lines().filter(|l| l.contains("boom-sshend")).count(),
             1,

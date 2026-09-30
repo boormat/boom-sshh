@@ -74,13 +74,23 @@ eval "$(boom-sshh agent --yolo)"
 
 `--yolo` only applies at startup. If an agent is already running, the new
 invocation still prints the existing socket and pid (so `eval` in a fresh shell
-keeps working) but fails with an error on stderr — kill the running agent and
-start it again to change the mode:
+keeps working) and exits 0, but reports on stderr that the flag has no effect,
+naming the mode that agent was started in. Kill it and start again to change
+modes:
 
 ```bash
 kill "$(cat ~/.boom-sshh/agent.pid)"
 eval "$(boom-sshh agent --yolo)"
 ```
+
+If `SSH_AUTH_SOCK` points at a *different* ssh-agent — gdm's gnome-keyring agent,
+a leftover `ssh-agent` — that agent is reported and boom-sshh starts anyway, so
+the shell ends up using boom-sshh. Adopting another agent would leave boom-sshh
+out of the loop, with nothing logged and no approvals.
+
+A startup line you edited to carry the flag survives `init`/`init-agent`: the
+rewritten block keeps the `--yolo` (dropping anything else it does not
+recognise), so re-initialising never silently turns approvals back on.
 
 Approval decisions are logged either way; in `--yolo` mode
 `~/.boom-sshh/auth.log` records `basis: "yolo"` and the history log is the only
